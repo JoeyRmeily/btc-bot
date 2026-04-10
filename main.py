@@ -114,6 +114,23 @@ async def webhook(request: Request):
 
     return {"status": "ok"}
 
+@app.post("/reset-trades")
+async def reset_trades(request: Request):
+    data = await request.json()
+    if data.get("secret") != SECRET:
+        return {"status": "unauthorized"}
+    p = load()
+    if p["trades"]:
+        last_trade = p["trades"].pop()
+        p["total_pnl"] -= last_trade["pnl"]
+        if last_trade["pnl"] > 0:
+            p["wins"] -= 1
+        else:
+            p["losses"] -= 1
+        save(p)
+        return {"status": "removed", "trade": last_trade}
+    return {"status": "no trades to remove"}
+
 @app.get("/status")
 async def status():
     p = load()
