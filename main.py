@@ -10,7 +10,7 @@ SECRET           = "btcbot2024"
 PORTFOLIO_FILE   = "portfolio.json"
 STARTING_BALANCE = 1000.0
 
-SL_PCT     = 1.0
+SL_PCT     = 1.5
 TP1_PCT    = 2.0
 TP2_PCT    = 3.5
 TP3_PCT    = 5.0
@@ -120,7 +120,7 @@ def partial_close(port, pos, qty_to_close, price, reason):
 # ─── Background price monitor (every 30 s) ────
 async def price_monitor():
     while True:
-        await asyncio.sleep(30)
+        await asyncio.sleep(10)
         port = load()
         if not port["positions"]:
             continue
