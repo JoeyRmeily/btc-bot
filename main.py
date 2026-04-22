@@ -377,6 +377,15 @@ async def reset_trades():
     })
     return {"status": "reset ok"}
 
+# ─── Seed portfolio (temporary admin) ────────
+@app.post("/admin/seed")
+async def seed(request: Request):
+    data = await request.json()
+    if data.get("secret") != SECRET:
+        return {"status": "unauthorized"}
+    save(data["portfolio"])
+    return {"status": "seeded"}
+
 # ─── Dashboard ────────────────────────────────
 @app.get("/status", response_class=HTMLResponse)
 async def status():
