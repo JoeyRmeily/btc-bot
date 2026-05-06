@@ -162,6 +162,7 @@ async def price_monitor():
             if not pos.get("tp1_hit") and price >= pos["tp1_price"]:
                 pnl, pnl_pct = partial_close(port, pos, pos["tp1_qty"], price, "TP1")
                 pos["tp1_hit"] = True
+                pos["sl_price"] = entry  # move SL to break-even
                 changed = True
                 await telegram(
                     f"🎯 <b>TP1 HIT — {symbol}</b>\n"
@@ -171,6 +172,7 @@ async def price_monitor():
                     f"📦 Closed 34% of position\n"
                     f"✅ P&L: <b>${pnl:.2f} ({pnl_pct:.2f}%)</b>\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
+                    f"🛡 SL moved to break-even: ${entry:,.2f}\n"
                     f"⏳ Watching TP2 at ${pos['tp2_price']:,.2f}\n"
                     f"🏦 Balance: ${port['balance']:.2f}\n"
                     f"⚠️ SIMULATION"
@@ -180,6 +182,7 @@ async def price_monitor():
             if pos.get("tp1_hit") and not pos.get("tp2_hit") and price >= pos["tp2_price"]:
                 pnl, pnl_pct = partial_close(port, pos, pos["tp2_qty"], price, "TP2")
                 pos["tp2_hit"] = True
+                pos["sl_price"] = pos["tp1_price"]  # move SL to TP1 — remainder always profits
                 changed = True
                 await telegram(
                     f"🎯🎯 <b>TP2 HIT — {symbol}</b>\n"
@@ -189,6 +192,7 @@ async def price_monitor():
                     f"📦 Closed 50% of remaining\n"
                     f"✅ P&L: <b>${pnl:.2f} ({pnl_pct:.2f}%)</b>\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
+                    f"🛡 SL moved to TP1: ${pos['sl_price']:,.2f} (locked profit)\n"
                     f"⏳ Trailing stop activates at TP3 ${pos['tp3_price']:,.2f}\n"
                     f"🏦 Balance: ${port['balance']:.2f}\n"
                     f"⚠️ SIMULATION"
