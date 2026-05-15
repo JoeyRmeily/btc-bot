@@ -15,8 +15,8 @@ TP1_PCT    = 2.0
 TP2_PCT    = 3.5
 TP3_PCT    = 5.0
 TRAIL_PCT  = 1.5
-TRADE_SIZE = 0.33
-MAX_POSITIONS = 3
+TRADE_SIZE = 0.20
+MAX_POSITIONS = 12
 
 # ─── Portfolio ────────────────────────────────
 def load():
