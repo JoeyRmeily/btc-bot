@@ -89,12 +89,15 @@ async def get_price(symbol="BTCUSDT"):
 
 # ─── Partial close helper ─────────────────────
 def partial_close(port, pos, qty_to_close, price, reason):
-    value   = qty_to_close * price
-    cost    = qty_to_close * pos["entry_price"]
-    pnl     = value - cost
-    pnl_pct = (pnl / cost) * 100
+    entry = pos["entry_price"]
+    if pos.get("side") == "SHORT":
+        pnl = (entry - price) * qty_to_close
+        port["balance"] += qty_to_close * entry + pnl
+    else:
+        pnl = (price - entry) * qty_to_close
+        port["balance"] += qty_to_close * price
+    pnl_pct = (pnl / (qty_to_close * entry)) * 100
 
-    port["balance"]   += value
     port["total_pnl"] += pnl
     if pnl > 0:
         port["wins"] += 1
@@ -137,104 +140,207 @@ async def price_monitor():
             now   = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
             entry = pos["entry_price"]
 
-            # ── Stop Loss ────────────────────────────────
-            if price <= pos["sl_price"] and pos["qty_remaining"] > 0:
-                pnl, pnl_pct = partial_close(port, pos, pos["qty_remaining"], price, "SL")
-                to_remove.append(pos)
-                changed = True
-                total = port["wins"] + port["losses"]
-                wr = (port["wins"] / total * 100) if total else 0
-                await telegram(
-                    f"🛑 <b>STOP LOSS — {symbol}</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"🕐 {now}\n"
-                    f"💰 Exit: <b>${price:,.2f}</b>\n"
-                    f"📥 Entry: ${entry:,.2f}\n"
-                    f"❌ P&L: <b>${pnl:.2f} ({pnl_pct:.2f}%)</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"🏦 Balance: ${port['balance']:.2f}\n"
-                    f"📊 Win Rate: {wr:.1f}% ({port['wins']}W/{port['losses']}L)\n"
-                    f"⚠️ SIMULATION"
-                )
-                continue
+            side = pos.get("side", "LONG")
 
-            # ── TP1 ──────────────────────────────────────
-            if not pos.get("tp1_hit") and price >= pos["tp1_price"]:
-                pnl, pnl_pct = partial_close(port, pos, pos["tp1_qty"], price, "TP1")
-                pos["tp1_hit"] = True
-                pos["sl_price"] = entry  # move SL to break-even
-                changed = True
-                await telegram(
-                    f"🎯 <b>TP1 HIT — {symbol}</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"🕐 {now}\n"
-                    f"💰 Price: <b>${price:,.2f}</b> (+{TP1_PCT}%)\n"
-                    f"📦 Closed 34% of position\n"
-                    f"✅ P&L: <b>${pnl:.2f} ({pnl_pct:.2f}%)</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"🛡 SL moved to break-even: ${entry:,.2f}\n"
-                    f"⏳ Watching TP2 at ${pos['tp2_price']:,.2f}\n"
-                    f"🏦 Balance: ${port['balance']:.2f}\n"
-                    f"⚠️ SIMULATION"
-                )
-
-            # ── TP2 ──────────────────────────────────────
-            if pos.get("tp1_hit") and not pos.get("tp2_hit") and price >= pos["tp2_price"]:
-                pnl, pnl_pct = partial_close(port, pos, pos["tp2_qty"], price, "TP2")
-                pos["tp2_hit"] = True
-                pos["sl_price"] = pos["tp1_price"]  # move SL to TP1 — remainder always profits
-                changed = True
-                await telegram(
-                    f"🎯🎯 <b>TP2 HIT — {symbol}</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"🕐 {now}\n"
-                    f"💰 Price: <b>${price:,.2f}</b> (+{TP2_PCT}%)\n"
-                    f"📦 Closed 50% of remaining\n"
-                    f"✅ P&L: <b>${pnl:.2f} ({pnl_pct:.2f}%)</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"🛡 SL moved to TP1: ${pos['sl_price']:,.2f} (locked profit)\n"
-                    f"⏳ Trailing stop activates at TP3 ${pos['tp3_price']:,.2f}\n"
-                    f"🏦 Balance: ${port['balance']:.2f}\n"
-                    f"⚠️ SIMULATION"
-                )
-
-            # ── TP3 — activate trailing stop ─────────────
-            if pos.get("tp2_hit") and not pos.get("tp3_hit") and price >= pos["tp3_price"]:
-                pos["tp3_hit"]    = True
-                pos["trail_active"] = True
-                pos["trail_peak"] = price
-                pos["trail_stop"] = round(price * (1 - TRAIL_PCT / 100), 2)
-                changed = True
-                await telegram(
-                    f"🚀 <b>TP3 REACHED — {symbol}</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"🕐 {now}\n"
-                    f"💰 Price: <b>${price:,.2f}</b> (+{TP3_PCT}%)\n"
-                    f"🔄 Trailing stop: ${pos['trail_stop']:,.2f} (-{TRAIL_PCT}%)\n"
-                    f"📦 Holding remainder — letting it run!\n"
-                    f"⚠️ SIMULATION"
-                )
-
-            # ── Trailing stop ─────────────────────────────
-            if pos.get("trail_active") and pos["qty_remaining"] > 0:
-                if price > pos.get("trail_peak", 0):
-                    pos["trail_peak"] = price
-                    pos["trail_stop"] = round(price * (1 - TRAIL_PCT / 100), 2)
-                    changed = True
-                if price <= pos["trail_stop"]:
-                    pnl, pnl_pct = partial_close(port, pos, pos["qty_remaining"], price, "TP3+Trail")
+            if side == "SHORT":
+                # ── SHORT Stop Loss (price goes UP) ──────────
+                if price >= pos["sl_price"] and pos["qty_remaining"] > 0:
+                    pnl, pnl_pct = partial_close(port, pos, pos["qty_remaining"], price, "SL")
                     to_remove.append(pos)
                     changed = True
+                    total = port["wins"] + port["losses"]
+                    wr = (port["wins"] / total * 100) if total else 0
                     await telegram(
-                        f"🏁 <b>TRAILING EXIT — {symbol}</b>\n"
+                        f"🛑 <b>STOP LOSS — SHORT {symbol}</b>\n"
                         f"━━━━━━━━━━━━━━━━━━\n"
                         f"🕐 {now}\n"
                         f"💰 Exit: <b>${price:,.2f}</b>\n"
-                        f"📈 Peak: ${pos['trail_peak']:,.2f}\n"
+                        f"📥 Entry: ${entry:,.2f}\n"
+                        f"❌ P&L: <b>${pnl:.2f} ({pnl_pct:.2f}%)</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"🏦 Balance: ${port['balance']:.2f}\n"
+                        f"📊 Win Rate: {wr:.1f}% ({port['wins']}W/{port['losses']}L)\n"
+                        f"⚠️ SIMULATION"
+                    )
+                    continue
+
+                # ── SHORT TP1 (price goes DOWN) ───────────────
+                if not pos.get("tp1_hit") and price <= pos["tp1_price"]:
+                    pnl, pnl_pct = partial_close(port, pos, pos["tp1_qty"], price, "TP1")
+                    pos["tp1_hit"]  = True
+                    pos["sl_price"] = entry  # move SL to break-even
+                    changed = True
+                    await telegram(
+                        f"🎯 <b>TP1 HIT — SHORT {symbol}</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"🕐 {now}\n"
+                        f"💰 Price: <b>${price:,.2f}</b> (-{TP1_PCT}%)\n"
+                        f"📦 Closed 34% of position\n"
                         f"✅ P&L: <b>${pnl:.2f} ({pnl_pct:.2f}%)</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"🛡 SL moved to break-even: ${entry:,.2f}\n"
+                        f"⏳ Watching TP2 at ${pos['tp2_price']:,.2f}\n"
                         f"🏦 Balance: ${port['balance']:.2f}\n"
                         f"⚠️ SIMULATION"
                     )
+
+                # ── SHORT TP2 ─────────────────────────────────
+                if pos.get("tp1_hit") and not pos.get("tp2_hit") and price <= pos["tp2_price"]:
+                    pnl, pnl_pct = partial_close(port, pos, pos["tp2_qty"], price, "TP2")
+                    pos["tp2_hit"]  = True
+                    pos["sl_price"] = pos["tp1_price"]  # lock profit at TP1 level
+                    changed = True
+                    await telegram(
+                        f"🎯🎯 <b>TP2 HIT — SHORT {symbol}</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"🕐 {now}\n"
+                        f"💰 Price: <b>${price:,.2f}</b> (-{TP2_PCT}%)\n"
+                        f"📦 Closed 50% of remaining\n"
+                        f"✅ P&L: <b>${pnl:.2f} ({pnl_pct:.2f}%)</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"🛡 SL moved to TP1: ${pos['sl_price']:,.2f} (locked profit)\n"
+                        f"⏳ Trailing stop activates at TP3 ${pos['tp3_price']:,.2f}\n"
+                        f"🏦 Balance: ${port['balance']:.2f}\n"
+                        f"⚠️ SIMULATION"
+                    )
+
+                # ── SHORT TP3 — activate trailing ─────────────
+                if pos.get("tp2_hit") and not pos.get("tp3_hit") and price <= pos["tp3_price"]:
+                    pos["tp3_hit"]      = True
+                    pos["trail_active"] = True
+                    pos["trail_low"]    = price
+                    pos["trail_stop"]   = round(price * (1 + TRAIL_PCT / 100), 2)
+                    changed = True
+                    await telegram(
+                        f"🚀 <b>TP3 REACHED — SHORT {symbol}</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"🕐 {now}\n"
+                        f"💰 Price: <b>${price:,.2f}</b> (-{TP3_PCT}%)\n"
+                        f"🔄 Trailing stop: ${pos['trail_stop']:,.2f} (+{TRAIL_PCT}%)\n"
+                        f"📦 Holding remainder — letting it run!\n"
+                        f"⚠️ SIMULATION"
+                    )
+
+                # ── SHORT Trailing stop ───────────────────────
+                if pos.get("trail_active") and pos["qty_remaining"] > 0:
+                    if price < pos.get("trail_low", float("inf")):
+                        pos["trail_low"]  = price
+                        pos["trail_stop"] = round(price * (1 + TRAIL_PCT / 100), 2)
+                        changed = True
+                    if price >= pos["trail_stop"]:
+                        pnl, pnl_pct = partial_close(port, pos, pos["qty_remaining"], price, "TP3+Trail")
+                        to_remove.append(pos)
+                        changed = True
+                        await telegram(
+                            f"🏁 <b>TRAILING EXIT — SHORT {symbol}</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━\n"
+                            f"🕐 {now}\n"
+                            f"💰 Exit: <b>${price:,.2f}</b>\n"
+                            f"📉 Low: ${pos['trail_low']:,.2f}\n"
+                            f"✅ P&L: <b>${pnl:.2f} ({pnl_pct:.2f}%)</b>\n"
+                            f"🏦 Balance: ${port['balance']:.2f}\n"
+                            f"⚠️ SIMULATION"
+                        )
+
+            else:
+                # ── LONG Stop Loss ────────────────────────────
+                if price <= pos["sl_price"] and pos["qty_remaining"] > 0:
+                    pnl, pnl_pct = partial_close(port, pos, pos["qty_remaining"], price, "SL")
+                    to_remove.append(pos)
+                    changed = True
+                    total = port["wins"] + port["losses"]
+                    wr = (port["wins"] / total * 100) if total else 0
+                    await telegram(
+                        f"🛑 <b>STOP LOSS — {symbol}</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"🕐 {now}\n"
+                        f"💰 Exit: <b>${price:,.2f}</b>\n"
+                        f"📥 Entry: ${entry:,.2f}\n"
+                        f"❌ P&L: <b>${pnl:.2f} ({pnl_pct:.2f}%)</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"🏦 Balance: ${port['balance']:.2f}\n"
+                        f"📊 Win Rate: {wr:.1f}% ({port['wins']}W/{port['losses']}L)\n"
+                        f"⚠️ SIMULATION"
+                    )
+                    continue
+
+                # ── LONG TP1 ──────────────────────────────────
+                if not pos.get("tp1_hit") and price >= pos["tp1_price"]:
+                    pnl, pnl_pct = partial_close(port, pos, pos["tp1_qty"], price, "TP1")
+                    pos["tp1_hit"]  = True
+                    pos["sl_price"] = entry  # move SL to break-even
+                    changed = True
+                    await telegram(
+                        f"🎯 <b>TP1 HIT — {symbol}</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"🕐 {now}\n"
+                        f"💰 Price: <b>${price:,.2f}</b> (+{TP1_PCT}%)\n"
+                        f"📦 Closed 34% of position\n"
+                        f"✅ P&L: <b>${pnl:.2f} ({pnl_pct:.2f}%)</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"🛡 SL moved to break-even: ${entry:,.2f}\n"
+                        f"⏳ Watching TP2 at ${pos['tp2_price']:,.2f}\n"
+                        f"🏦 Balance: ${port['balance']:.2f}\n"
+                        f"⚠️ SIMULATION"
+                    )
+
+                # ── LONG TP2 ──────────────────────────────────
+                if pos.get("tp1_hit") and not pos.get("tp2_hit") and price >= pos["tp2_price"]:
+                    pnl, pnl_pct = partial_close(port, pos, pos["tp2_qty"], price, "TP2")
+                    pos["tp2_hit"]  = True
+                    pos["sl_price"] = pos["tp1_price"]  # move SL to TP1 — remainder always profits
+                    changed = True
+                    await telegram(
+                        f"🎯🎯 <b>TP2 HIT — {symbol}</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"🕐 {now}\n"
+                        f"💰 Price: <b>${price:,.2f}</b> (+{TP2_PCT}%)\n"
+                        f"📦 Closed 50% of remaining\n"
+                        f"✅ P&L: <b>${pnl:.2f} ({pnl_pct:.2f}%)</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"🛡 SL moved to TP1: ${pos['sl_price']:,.2f} (locked profit)\n"
+                        f"⏳ Trailing stop activates at TP3 ${pos['tp3_price']:,.2f}\n"
+                        f"🏦 Balance: ${port['balance']:.2f}\n"
+                        f"⚠️ SIMULATION"
+                    )
+
+                # ── LONG TP3 — activate trailing ──────────────
+                if pos.get("tp2_hit") and not pos.get("tp3_hit") and price >= pos["tp3_price"]:
+                    pos["tp3_hit"]      = True
+                    pos["trail_active"] = True
+                    pos["trail_peak"]   = price
+                    pos["trail_stop"]   = round(price * (1 - TRAIL_PCT / 100), 2)
+                    changed = True
+                    await telegram(
+                        f"🚀 <b>TP3 REACHED — {symbol}</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"🕐 {now}\n"
+                        f"💰 Price: <b>${price:,.2f}</b> (+{TP3_PCT}%)\n"
+                        f"🔄 Trailing stop: ${pos['trail_stop']:,.2f} (-{TRAIL_PCT}%)\n"
+                        f"📦 Holding remainder — letting it run!\n"
+                        f"⚠️ SIMULATION"
+                    )
+
+                # ── LONG Trailing stop ─────────────────────────
+                if pos.get("trail_active") and pos["qty_remaining"] > 0:
+                    if price > pos.get("trail_peak", 0):
+                        pos["trail_peak"] = price
+                        pos["trail_stop"] = round(price * (1 - TRAIL_PCT / 100), 2)
+                        changed = True
+                    if price <= pos["trail_stop"]:
+                        pnl, pnl_pct = partial_close(port, pos, pos["qty_remaining"], price, "TP3+Trail")
+                        to_remove.append(pos)
+                        changed = True
+                        await telegram(
+                            f"🏁 <b>TRAILING EXIT — {symbol}</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━\n"
+                            f"🕐 {now}\n"
+                            f"💰 Exit: <b>${price:,.2f}</b>\n"
+                            f"📈 Peak: ${pos['trail_peak']:,.2f}\n"
+                            f"✅ P&L: <b>${pnl:.2f} ({pnl_pct:.2f}%)</b>\n"
+                            f"🏦 Balance: ${port['balance']:.2f}\n"
+                            f"⚠️ SIMULATION"
+                        )
 
         for pos in to_remove:
             if pos in port["positions"]:
@@ -336,6 +442,101 @@ async def webhook(request: Request):
             f"📂 Open: {len(port['positions'])}/{MAX_POSITIONS}\n"
             f"⚠️ SIMULATION — No real money used"
         )
+
+    # ── SHORT entry ──────────────────────────────
+    elif signal in ("short", "sell short"):
+        if len(port["positions"]) >= MAX_POSITIONS:
+            await telegram(f"⚠️ Max {MAX_POSITIONS} positions open — SHORT skipped ({symbol})")
+            return {"status": "skipped"}
+
+        amount = port["balance"] * TRADE_SIZE
+        if amount < 10:
+            await telegram(f"⚠️ Insufficient balance — SHORT skipped ({symbol})")
+            return {"status": "skipped"}
+
+        qty_total = amount / price
+        tp1_qty   = round(qty_total * 0.34, 6)
+        tp2_qty   = round((qty_total - tp1_qty) * 0.50, 6)
+        tp3_qty   = round(qty_total - tp1_qty - tp2_qty, 6)
+
+        sl  = round(price * (1 + SL_PCT  / 100), 2)
+        tp1 = round(price * (1 - TP1_PCT / 100), 2)
+        tp2 = round(price * (1 - TP2_PCT / 100), 2)
+        tp3 = round(price * (1 - TP3_PCT / 100), 2)
+
+        pos = {
+            "symbol":        symbol,
+            "side":          "SHORT",
+            "entry_price":   price,
+            "qty_total":     round(qty_total, 6),
+            "qty_remaining": round(qty_total, 6),
+            "tp1_qty":       tp1_qty,
+            "tp2_qty":       tp2_qty,
+            "tp3_qty":       tp3_qty,
+            "amount":        amount,
+            "time":          now,
+            "sl_price":      sl,
+            "tp1_price":     tp1,
+            "tp2_price":     tp2,
+            "tp3_price":     tp3,
+            "tp1_hit":       False,
+            "tp2_hit":       False,
+            "tp3_hit":       False,
+            "trail_active":  False,
+            "trail_low":     None,
+            "trail_stop":    None,
+            "score":         score
+        }
+        port["balance"] -= amount
+        port["positions"].append(pos)
+        save(port)
+
+        await telegram(
+            f"🔴 <b>SHORT ENTRY — {symbol}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🕐 {now}\n"
+            f"💰 Entry: <b>${price:,.2f}</b>\n"
+            f"📊 Score: {score}/7 — {score_label}\n"
+            f"📦 Size: ${amount:.2f} ({qty_total:.6f} {symbol[:3]})\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🛑 SL:  ${sl:,.2f}  (+{SL_PCT}%)\n"
+            f"🎯 TP1: ${tp1:,.2f} (-{TP1_PCT}%)  → 34%\n"
+            f"🎯 TP2: ${tp2:,.2f} (-{TP2_PCT}%)  → 50% rem\n"
+            f"🎯 TP3: ${tp3:,.2f} (-{TP3_PCT}%) + trail\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🏦 Free Balance: ${port['balance']:.2f}\n"
+            f"📂 Open: {len(port['positions'])}/{MAX_POSITIONS}\n"
+            f"⚠️ SIMULATION — No real money used"
+        )
+
+    # ── SHORT exit ────────────────────────────────
+    elif signal in ("short_close", "buy to cover"):
+        shorts = [p for p in port["positions"] if p["symbol"] == symbol and p["side"] == "SHORT"]
+        if not shorts:
+            await telegram(f"⚠️ SHORT CLOSE signal — no SHORT open for {symbol}")
+            return {"status": "no_position"}
+
+        for pos in shorts:
+            qty = pos["qty_remaining"]
+            if qty <= 0:
+                port["positions"].remove(pos)
+                continue
+            pnl, pnl_pct = partial_close(port, pos, qty, price, "SIGNAL EXIT")
+            port["positions"].remove(pos)
+            total = port["wins"] + port["losses"]
+            wr    = (port["wins"] / total * 100) if total else 0
+            emoji = "✅" if pnl > 0 else "❌"
+            await telegram(
+                f"📤 <b>SHORT CLOSE — {symbol}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🕐 {now}\n"
+                f"💰 Exit: <b>${price:,.2f}</b>\n"
+                f"{emoji} P&L: <b>${pnl:.2f} ({pnl_pct:.2f}%)</b>\n"
+                f"🏦 Balance: ${port['balance']:.2f}\n"
+                f"📊 Win Rate: {wr:.1f}% ({port['wins']}W/{port['losses']}L)\n"
+                f"⚠️ SIMULATION"
+            )
+        save(port)
 
     # ── LONG exit (sell signal) ───────────────────
     elif signal == "sell":
