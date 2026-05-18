@@ -609,14 +609,15 @@ async def status():
     total  = port["wins"] + port["losses"]
     wr     = (port["wins"] / total * 100) if total else 0
     unreal = sum(
-        (live_prices.get(p["symbol"], p["entry_price"]) - p["entry_price"]) * p["qty_remaining"]
+        ((p["entry_price"] - live_prices.get(p["symbol"], p["entry_price"])) if p.get("side") == "SHORT"
+         else (live_prices.get(p["symbol"], p["entry_price"]) - p["entry_price"])) * p["qty_remaining"]
         for p in positions
     )
 
     cards_html = ""
     for pos in positions:
         price = live_prices.get(pos["symbol"], pos["entry_price"])
-        upnl  = (price - pos["entry_price"]) * pos["qty_remaining"]
+        upnl  = ((pos["entry_price"] - price) if pos.get("side") == "SHORT" else (price - pos["entry_price"])) * pos["qty_remaining"]
         upct  = (upnl / pos["amount"]) * 100 if pos["amount"] else 0
         color = "#00c853" if upnl >= 0 else "#f44336"
         tp1c  = "✅" if pos.get("tp1_hit") else "⬜"
