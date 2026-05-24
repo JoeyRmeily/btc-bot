@@ -2,7 +2,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from contextlib import asynccontextmanager
 from datetime import datetime
-import httpx, json, os, asyncio
+import httpx, json, os, asyncio, websockets
 
 TELEGRAM_TOKEN   = "8635147020:AAGxhQLIJQfN7FUWGr-3gcQam7uORywuesQ"
 TELEGRAM_CHAT_ID = "6623057612"
@@ -79,6 +79,8 @@ async def telegram(msg):
                                 "text": msg, "parse_mode": "HTML"})
 
 # ─── Live price ───────────────────────────────
+price_cache: dict[str, float] = {}
+
 async def get_price(symbol="BTCUSDT"):
     try:
         async with httpx.AsyncClient(timeout=5) as c:
@@ -86,6 +88,21 @@ async def get_price(symbol="BTCUSDT"):
             return float(r.json()["price"])
     except Exception:
         return None
+
+async def ws_price_feed():
+    """Stream real-time prices from Binance WebSocket into price_cache."""
+    url = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"
+    while True:
+        try:
+            async with websockets.connect(url, ping_interval=20) as ws:
+                async for raw in ws:
+                    data = json.loads(raw)
+                    symbol = data.get("s")
+                    price  = data.get("p")
+                    if symbol and price:
+                        price_cache[symbol] = float(price)
+        except Exception:
+            await asyncio.sleep(5)  # reconnect after 5s on any error
 
 # ─── Partial close helper ─────────────────────
 def partial_close(port, pos, qty_to_close, price, reason):
@@ -120,10 +137,10 @@ def partial_close(port, pos, qty_to_close, price, reason):
     pos["qty_remaining"] -= qty_to_close
     return pnl, pnl_pct
 
-# ─── Background price monitor (every 30 s) ────
+# ─── Background price monitor ─────────────────
 async def price_monitor():
     while True:
-        await asyncio.sleep(10)
+        await asyncio.sleep(1)
         port = load()
         if not port["positions"]:
             continue
@@ -133,7 +150,7 @@ async def price_monitor():
 
         for pos in port["positions"]:
             symbol = pos.get("symbol", "BTCUSDT")
-            price  = await get_price(symbol)
+            price  = price_cache.get(symbol) or await get_price(symbol)
             if price is None:
                 continue
 
@@ -351,9 +368,11 @@ async def price_monitor():
 
 @asynccontextmanager
 async def lifespan(_app):
-    task = asyncio.create_task(price_monitor())
+    ws_task      = asyncio.create_task(ws_price_feed())
+    monitor_task = asyncio.create_task(price_monitor())
     yield
-    task.cancel()
+    ws_task.cancel()
+    monitor_task.cancel()
 
 app = FastAPI(lifespan=lifespan)
 
