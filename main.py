@@ -663,7 +663,7 @@ async def status():
         cards_html += '<div class="card empty-card">Empty Slot</div>'
 
     rows = ""
-    for t in reversed(trades[-10:]):
+    for t in reversed(trades):
         color = "#00c853" if t["pnl"] > 0 else "#f44336"
         rows += f"""<tr>
           <td>{t.get('side','LONG')} {t.get('symbol','BTCUSDT')}</td>
@@ -736,7 +736,7 @@ async def status():
   <h2>Open Positions</h2>
   <div class="cards">{cards_html}</div>
 
-  <h2>Last 10 Trades</h2>
+  <h2>All Trades</h2>
   <table>
     <tr><th>Type</th><th>Entry</th><th>Exit</th><th>P&amp;L</th><th>Reason</th></tr>
     {rows if rows else '<tr><td colspan="5" style="color:#333;text-align:center">No trades yet</td></tr>'}
