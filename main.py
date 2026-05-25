@@ -745,6 +745,12 @@ async def status():
 </html>"""
     return html
 
+@app.get("/my-ip")
+async def my_ip():
+    async with httpx.AsyncClient() as c:
+        r = await c.get("https://api.ipify.org?format=json")
+        return r.json()
+
 @app.get("/")
 async def root():
     return {"status": "BTC Bot V9 running ✅"}
