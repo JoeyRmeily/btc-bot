@@ -2,7 +2,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from contextlib import asynccontextmanager
 from datetime import datetime
-import httpx, json, os, asyncio, websockets
+import httpx, json, os, asyncio, websockets, hmac, hashlib, time
 
 TELEGRAM_TOKEN   = "8635147020:AAGxhQLIJQfN7FUWGr-3gcQam7uORywuesQ"
 TELEGRAM_CHAT_ID = "6623057612"
@@ -17,6 +17,59 @@ TP3_PCT    = 5.0
 TRAIL_PCT  = 1.5
 TRADE_SIZE = 0.20
 MAX_POSITIONS = 12
+
+# ─── Binance Futures (live trading) ───────────
+LIVE_TRADING       = os.environ.get("LIVE_TRADING", "false").lower() == "true"
+BINANCE_API_KEY    = os.environ.get("BINANCE_API_KEY", "")
+BINANCE_SECRET_KEY = os.environ.get("BINANCE_SECRET_KEY", "")
+FUTURES_BASE       = "https://fapi.binance.com"
+LEVERAGE           = 2
+LIVE_SIZE_USD      = float(os.environ.get("LIVE_SIZE_USD", "100"))  # $ per live trade
+
+# ─── Binance Futures helpers ──────────────────
+def _sign(params: dict) -> dict:
+    params["timestamp"] = int(time.time() * 1000)
+    query = "&".join(f"{k}={v}" for k, v in params.items())
+    params["signature"] = hmac.new(
+        BINANCE_SECRET_KEY.encode(), query.encode(), hashlib.sha256
+    ).hexdigest()
+    return params
+
+async def futures_order(symbol: str, side: str, qty: float, reduce_only: bool = False):
+    params = _sign({
+        "symbol":   symbol,
+        "side":     side,
+        "type":     "MARKET",
+        "quantity": round(qty, 3),
+    })
+    if reduce_only:
+        params["reduceOnly"] = "true"
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(f"{FUTURES_BASE}/fapi/v1/order", params=params,
+                             headers={"X-MBX-APIKEY": BINANCE_API_KEY})
+            result = r.json()
+            if result.get("code"):
+                await telegram(f"⚠️ Binance order error: {result.get('msg')} (code {result.get('code')})")
+            return result
+    except Exception as e:
+        await telegram(f"⚠️ Binance request failed: {e}")
+        return {}
+
+async def init_futures():
+    for symbol in ["BTCUSDT"]:
+        try:
+            p = _sign({"symbol": symbol, "marginType": "ISOLATED"})
+            async with httpx.AsyncClient(timeout=10) as c:
+                await c.post(f"{FUTURES_BASE}/fapi/v1/marginType", params=p,
+                             headers={"X-MBX-APIKEY": BINANCE_API_KEY})
+            p = _sign({"symbol": symbol, "leverage": LEVERAGE})
+            async with httpx.AsyncClient(timeout=10) as c:
+                r = await c.post(f"{FUTURES_BASE}/fapi/v1/leverage", params=p,
+                                 headers={"X-MBX-APIKEY": BINANCE_API_KEY})
+                await telegram(f"✅ Binance LIVE MODE ON — {symbol} {LEVERAGE}x isolated\nSize per trade: ${LIVE_SIZE_USD}")
+        except Exception as e:
+            await telegram(f"⚠️ init_futures error ({symbol}): {e}")
 
 # ─── Portfolio ────────────────────────────────
 def load():
@@ -159,9 +212,15 @@ async def price_monitor():
 
             side = pos.get("side", "LONG")
 
+            mode_tag = "🔴 LIVE" if LIVE_TRADING else "⚠️ SIMULATION"
+
             if side == "SHORT":
                 # ── SHORT Stop Loss (price goes UP) ──────────
                 if price >= pos["sl_price"] and pos["qty_remaining"] > 0:
+                    lq = pos.get("live_qty", 0) - pos.get("live_tp1_qty", 0) * pos.get("tp1_hit", False) - pos.get("live_tp2_qty", 0) * pos.get("tp2_hit", False)
+                    lq = max(round(lq, 3), 0)
+                    if LIVE_TRADING and lq >= 0.001:
+                        await futures_order(symbol, "BUY", lq, reduce_only=True)
                     pnl, pnl_pct = partial_close(port, pos, pos["qty_remaining"], price, "SL")
                     to_remove.append(pos)
                     changed = True
@@ -177,15 +236,17 @@ async def price_monitor():
                         f"━━━━━━━━━━━━━━━━━━\n"
                         f"🏦 Balance: ${port['balance']:.2f}\n"
                         f"📊 Win Rate: {wr:.1f}% ({port['wins']}W/{port['losses']}L)\n"
-                        f"⚠️ SIMULATION"
+                        f"{mode_tag}"
                     )
                     continue
 
                 # ── SHORT TP1 (price goes DOWN) ───────────────
                 if not pos.get("tp1_hit") and price <= pos["tp1_price"]:
+                    if LIVE_TRADING and pos.get("live_tp1_qty", 0) >= 0.001:
+                        await futures_order(symbol, "BUY", pos["live_tp1_qty"], reduce_only=True)
                     pnl, pnl_pct = partial_close(port, pos, pos["tp1_qty"], price, "TP1")
                     pos["tp1_hit"]  = True
-                    pos["sl_price"] = entry  # move SL to break-even
+                    pos["sl_price"] = entry
                     changed = True
                     await telegram(
                         f"🎯 <b>TP1 HIT — SHORT {symbol}</b>\n"
@@ -198,14 +259,16 @@ async def price_monitor():
                         f"🛡 SL moved to break-even: ${entry:,.2f}\n"
                         f"⏳ Watching TP2 at ${pos['tp2_price']:,.2f}\n"
                         f"🏦 Balance: ${port['balance']:.2f}\n"
-                        f"⚠️ SIMULATION"
+                        f"{mode_tag}"
                     )
 
                 # ── SHORT TP2 ─────────────────────────────────
                 if pos.get("tp1_hit") and not pos.get("tp2_hit") and price <= pos["tp2_price"]:
+                    if LIVE_TRADING and pos.get("live_tp2_qty", 0) >= 0.001:
+                        await futures_order(symbol, "BUY", pos["live_tp2_qty"], reduce_only=True)
                     pnl, pnl_pct = partial_close(port, pos, pos["tp2_qty"], price, "TP2")
                     pos["tp2_hit"]  = True
-                    pos["sl_price"] = pos["tp1_price"]  # lock profit at TP1 level
+                    pos["sl_price"] = pos["tp1_price"]
                     changed = True
                     await telegram(
                         f"🎯🎯 <b>TP2 HIT — SHORT {symbol}</b>\n"
@@ -218,7 +281,7 @@ async def price_monitor():
                         f"🛡 SL moved to TP1: ${pos['sl_price']:,.2f} (locked profit)\n"
                         f"⏳ Trailing stop activates at TP3 ${pos['tp3_price']:,.2f}\n"
                         f"🏦 Balance: ${port['balance']:.2f}\n"
-                        f"⚠️ SIMULATION"
+                        f"{mode_tag}"
                     )
 
                 # ── SHORT TP3 — activate trailing ─────────────
@@ -235,7 +298,7 @@ async def price_monitor():
                         f"💰 Price: <b>${price:,.2f}</b> (-{TP3_PCT}%)\n"
                         f"🔄 Trailing stop: ${pos['trail_stop']:,.2f} (+{TRAIL_PCT}%)\n"
                         f"📦 Holding remainder — letting it run!\n"
-                        f"⚠️ SIMULATION"
+                        f"{mode_tag}"
                     )
 
                 # ── SHORT Trailing stop ───────────────────────
@@ -245,6 +308,8 @@ async def price_monitor():
                         pos["trail_stop"] = round(price * (1 + TRAIL_PCT / 100), 2)
                         changed = True
                     if price >= pos["trail_stop"]:
+                        if LIVE_TRADING and pos.get("live_tp3_qty", 0) >= 0.001:
+                            await futures_order(symbol, "BUY", pos["live_tp3_qty"], reduce_only=True)
                         pnl, pnl_pct = partial_close(port, pos, pos["qty_remaining"], price, "TP3+Trail")
                         to_remove.append(pos)
                         changed = True
@@ -256,12 +321,16 @@ async def price_monitor():
                             f"📉 Low: ${pos['trail_low']:,.2f}\n"
                             f"✅ P&L: <b>${pnl:.2f} ({pnl_pct:.2f}%)</b>\n"
                             f"🏦 Balance: ${port['balance']:.2f}\n"
-                            f"⚠️ SIMULATION"
+                            f"{mode_tag}"
                         )
 
             else:
                 # ── LONG Stop Loss ────────────────────────────
                 if price <= pos["sl_price"] and pos["qty_remaining"] > 0:
+                    lq = pos.get("live_qty", 0) - pos.get("live_tp1_qty", 0) * pos.get("tp1_hit", False) - pos.get("live_tp2_qty", 0) * pos.get("tp2_hit", False)
+                    lq = max(round(lq, 3), 0)
+                    if LIVE_TRADING and lq >= 0.001:
+                        await futures_order(symbol, "SELL", lq, reduce_only=True)
                     pnl, pnl_pct = partial_close(port, pos, pos["qty_remaining"], price, "SL")
                     to_remove.append(pos)
                     changed = True
@@ -277,15 +346,17 @@ async def price_monitor():
                         f"━━━━━━━━━━━━━━━━━━\n"
                         f"🏦 Balance: ${port['balance']:.2f}\n"
                         f"📊 Win Rate: {wr:.1f}% ({port['wins']}W/{port['losses']}L)\n"
-                        f"⚠️ SIMULATION"
+                        f"{mode_tag}"
                     )
                     continue
 
                 # ── LONG TP1 ──────────────────────────────────
                 if not pos.get("tp1_hit") and price >= pos["tp1_price"]:
+                    if LIVE_TRADING and pos.get("live_tp1_qty", 0) >= 0.001:
+                        await futures_order(symbol, "SELL", pos["live_tp1_qty"], reduce_only=True)
                     pnl, pnl_pct = partial_close(port, pos, pos["tp1_qty"], price, "TP1")
                     pos["tp1_hit"]  = True
-                    pos["sl_price"] = entry  # move SL to break-even
+                    pos["sl_price"] = entry
                     changed = True
                     await telegram(
                         f"🎯 <b>TP1 HIT — {symbol}</b>\n"
@@ -298,14 +369,16 @@ async def price_monitor():
                         f"🛡 SL moved to break-even: ${entry:,.2f}\n"
                         f"⏳ Watching TP2 at ${pos['tp2_price']:,.2f}\n"
                         f"🏦 Balance: ${port['balance']:.2f}\n"
-                        f"⚠️ SIMULATION"
+                        f"{mode_tag}"
                     )
 
                 # ── LONG TP2 ──────────────────────────────────
                 if pos.get("tp1_hit") and not pos.get("tp2_hit") and price >= pos["tp2_price"]:
+                    if LIVE_TRADING and pos.get("live_tp2_qty", 0) >= 0.001:
+                        await futures_order(symbol, "SELL", pos["live_tp2_qty"], reduce_only=True)
                     pnl, pnl_pct = partial_close(port, pos, pos["tp2_qty"], price, "TP2")
                     pos["tp2_hit"]  = True
-                    pos["sl_price"] = pos["tp1_price"]  # move SL to TP1 — remainder always profits
+                    pos["sl_price"] = pos["tp1_price"]
                     changed = True
                     await telegram(
                         f"🎯🎯 <b>TP2 HIT — {symbol}</b>\n"
@@ -318,7 +391,7 @@ async def price_monitor():
                         f"🛡 SL moved to TP1: ${pos['sl_price']:,.2f} (locked profit)\n"
                         f"⏳ Trailing stop activates at TP3 ${pos['tp3_price']:,.2f}\n"
                         f"🏦 Balance: ${port['balance']:.2f}\n"
-                        f"⚠️ SIMULATION"
+                        f"{mode_tag}"
                     )
 
                 # ── LONG TP3 — activate trailing ──────────────
@@ -335,7 +408,7 @@ async def price_monitor():
                         f"💰 Price: <b>${price:,.2f}</b> (+{TP3_PCT}%)\n"
                         f"🔄 Trailing stop: ${pos['trail_stop']:,.2f} (-{TRAIL_PCT}%)\n"
                         f"📦 Holding remainder — letting it run!\n"
-                        f"⚠️ SIMULATION"
+                        f"{mode_tag}"
                     )
 
                 # ── LONG Trailing stop ─────────────────────────
@@ -345,6 +418,8 @@ async def price_monitor():
                         pos["trail_stop"] = round(price * (1 - TRAIL_PCT / 100), 2)
                         changed = True
                     if price <= pos["trail_stop"]:
+                        if LIVE_TRADING and pos.get("live_tp3_qty", 0) >= 0.001:
+                            await futures_order(symbol, "SELL", pos["live_tp3_qty"], reduce_only=True)
                         pnl, pnl_pct = partial_close(port, pos, pos["qty_remaining"], price, "TP3+Trail")
                         to_remove.append(pos)
                         changed = True
@@ -356,7 +431,7 @@ async def price_monitor():
                             f"📈 Peak: ${pos['trail_peak']:,.2f}\n"
                             f"✅ P&L: <b>${pnl:.2f} ({pnl_pct:.2f}%)</b>\n"
                             f"🏦 Balance: ${port['balance']:.2f}\n"
-                            f"⚠️ SIMULATION"
+                            f"{mode_tag}"
                         )
 
         for pos in to_remove:
@@ -368,6 +443,8 @@ async def price_monitor():
 
 @asynccontextmanager
 async def lifespan(_app):
+    if LIVE_TRADING:
+        await init_futures()
     ws_task      = asyncio.create_task(ws_price_feed())
     monitor_task = asyncio.create_task(price_monitor())
     yield
@@ -412,6 +489,12 @@ async def webhook(request: Request):
         tp2_qty   = round((qty_total - tp1_qty) * 0.50, 6)
         tp3_qty   = round(qty_total - tp1_qty - tp2_qty, 6)
 
+        # live qty uses fixed LIVE_SIZE_USD, independent of virtual portfolio
+        live_qty       = round(LIVE_SIZE_USD / price, 3) if LIVE_TRADING else 0
+        live_tp1_qty   = round(live_qty * 0.34, 3)
+        live_tp2_qty   = round((live_qty - live_tp1_qty) * 0.50, 3)
+        live_tp3_qty   = round(live_qty - live_tp1_qty - live_tp2_qty, 3)
+
         sl  = round(price * (1 - SL_PCT  / 100), 2)
         tp1 = round(price * (1 + TP1_PCT / 100), 2)
         tp2 = round(price * (1 + TP2_PCT / 100), 2)
@@ -438,11 +521,18 @@ async def webhook(request: Request):
             "trail_active":  False,
             "trail_peak":    None,
             "trail_stop":    None,
-            "score":         score
+            "score":         score,
+            "live_qty":      live_qty,
+            "live_tp1_qty":  live_tp1_qty,
+            "live_tp2_qty":  live_tp2_qty,
+            "live_tp3_qty":  live_tp3_qty,
         }
         port["balance"] -= amount
         port["positions"].append(pos)
         save(port)
+
+        if LIVE_TRADING:
+            await futures_order(symbol, "BUY", live_qty)
 
         await telegram(
             f"🟢 <b>LONG ENTRY — {symbol}</b>\n"
@@ -478,6 +568,11 @@ async def webhook(request: Request):
         tp2_qty   = round((qty_total - tp1_qty) * 0.50, 6)
         tp3_qty   = round(qty_total - tp1_qty - tp2_qty, 6)
 
+        live_qty       = round(LIVE_SIZE_USD / price, 3) if LIVE_TRADING else 0
+        live_tp1_qty   = round(live_qty * 0.34, 3)
+        live_tp2_qty   = round((live_qty - live_tp1_qty) * 0.50, 3)
+        live_tp3_qty   = round(live_qty - live_tp1_qty - live_tp2_qty, 3)
+
         sl  = round(price * (1 + SL_PCT  / 100), 2)
         tp1 = round(price * (1 - TP1_PCT / 100), 2)
         tp2 = round(price * (1 - TP2_PCT / 100), 2)
@@ -504,11 +599,18 @@ async def webhook(request: Request):
             "trail_active":  False,
             "trail_low":     None,
             "trail_stop":    None,
-            "score":         score
+            "score":         score,
+            "live_qty":      live_qty,
+            "live_tp1_qty":  live_tp1_qty,
+            "live_tp2_qty":  live_tp2_qty,
+            "live_tp3_qty":  live_tp3_qty,
         }
         port["balance"] -= amount
         port["positions"].append(pos)
         save(port)
+
+        if LIVE_TRADING:
+            await futures_order(symbol, "SELL", live_qty)
 
         await telegram(
             f"🔴 <b>SHORT ENTRY — {symbol}</b>\n"
