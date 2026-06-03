@@ -56,6 +56,19 @@ async def futures_order(symbol: str, side: str, qty: float, reduce_only: bool = 
         await telegram(f"⚠️ Binance request failed: {e}")
         return {}
 
+async def get_live_balance():
+    try:
+        params = _sign({})
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(f"{FUTURES_BASE}/fapi/v2/balance", params=params,
+                            headers={"X-MBX-APIKEY": BINANCE_API_KEY})
+            for a in r.json():
+                if a["asset"] == "USDT":
+                    return float(a["walletBalance"]), float(a["availableBalance"])
+    except Exception:
+        pass
+    return None, None
+
 async def init_futures():
     for symbol in ["BTCUSDT"]:
         try:
@@ -110,14 +123,17 @@ def load():
                     "trail_stop":   None,
                     "score":        old.get("score", "6")
                 })
+        if "live_trades" not in p:
+            p["live_trades"] = []
         return p
     return {
-        "balance":   STARTING_BALANCE,
-        "positions": [],
-        "trades":    [],
-        "total_pnl": 0.0,
-        "wins":      0,
-        "losses":    0
+        "balance":    STARTING_BALANCE,
+        "positions":  [],
+        "trades":     [],
+        "total_pnl":  0.0,
+        "wins":       0,
+        "losses":     0,
+        "live_trades": []
     }
 
 def save(p):
@@ -190,6 +206,29 @@ def partial_close(port, pos, qty_to_close, price, reason):
     pos["qty_remaining"] -= qty_to_close
     return pnl, pnl_pct
 
+def live_record(port, pos, live_qty_closed, price, reason):
+    if not LIVE_TRADING or live_qty_closed < 0.001:
+        return
+    entry = pos["entry_price"]
+    if pos.get("side") == "SHORT":
+        pnl = (entry - price) * live_qty_closed
+    else:
+        pnl = (price - entry) * live_qty_closed
+    pnl_pct = (pnl / (live_qty_closed * entry)) * 100
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    port["live_trades"].append({
+        "symbol":     pos["symbol"],
+        "side":       pos["side"],
+        "entry":      entry,
+        "exit":       round(price, 2),
+        "qty":        round(live_qty_closed, 3),
+        "pnl":        round(pnl, 2),
+        "pnl_pct":    round(pnl_pct, 2),
+        "entry_time": pos["time"],
+        "exit_time":  now,
+        "reason":     reason
+    })
+
 # ─── Background price monitor ─────────────────
 async def price_monitor():
     while True:
@@ -222,6 +261,7 @@ async def price_monitor():
                     if LIVE_TRADING and lq >= 0.001:
                         await futures_order(symbol, "BUY", lq, reduce_only=True)
                     pnl, pnl_pct = partial_close(port, pos, pos["qty_remaining"], price, "SL")
+                    live_record(port, pos, lq, price, "SL")
                     to_remove.append(pos)
                     changed = True
                     total = port["wins"] + port["losses"]
@@ -245,6 +285,7 @@ async def price_monitor():
                     if LIVE_TRADING and pos.get("live_tp1_qty", 0) >= 0.001:
                         await futures_order(symbol, "BUY", pos["live_tp1_qty"], reduce_only=True)
                     pnl, pnl_pct = partial_close(port, pos, pos["tp1_qty"], price, "TP1")
+                    live_record(port, pos, pos.get("live_tp1_qty", 0), price, "TP1")
                     pos["tp1_hit"]  = True
                     pos["sl_price"] = entry
                     changed = True
@@ -267,6 +308,7 @@ async def price_monitor():
                     if LIVE_TRADING and pos.get("live_tp2_qty", 0) >= 0.001:
                         await futures_order(symbol, "BUY", pos["live_tp2_qty"], reduce_only=True)
                     pnl, pnl_pct = partial_close(port, pos, pos["tp2_qty"], price, "TP2")
+                    live_record(port, pos, pos.get("live_tp2_qty", 0), price, "TP2")
                     pos["tp2_hit"]  = True
                     pos["sl_price"] = pos["tp1_price"]
                     changed = True
@@ -311,6 +353,7 @@ async def price_monitor():
                         if LIVE_TRADING and pos.get("live_tp3_qty", 0) >= 0.001:
                             await futures_order(symbol, "BUY", pos["live_tp3_qty"], reduce_only=True)
                         pnl, pnl_pct = partial_close(port, pos, pos["qty_remaining"], price, "TP3+Trail")
+                        live_record(port, pos, pos.get("live_tp3_qty", 0), price, "TP3+Trail")
                         to_remove.append(pos)
                         changed = True
                         await telegram(
@@ -332,6 +375,7 @@ async def price_monitor():
                     if LIVE_TRADING and lq >= 0.001:
                         await futures_order(symbol, "SELL", lq, reduce_only=True)
                     pnl, pnl_pct = partial_close(port, pos, pos["qty_remaining"], price, "SL")
+                    live_record(port, pos, lq, price, "SL")
                     to_remove.append(pos)
                     changed = True
                     total = port["wins"] + port["losses"]
@@ -355,6 +399,7 @@ async def price_monitor():
                     if LIVE_TRADING and pos.get("live_tp1_qty", 0) >= 0.001:
                         await futures_order(symbol, "SELL", pos["live_tp1_qty"], reduce_only=True)
                     pnl, pnl_pct = partial_close(port, pos, pos["tp1_qty"], price, "TP1")
+                    live_record(port, pos, pos.get("live_tp1_qty", 0), price, "TP1")
                     pos["tp1_hit"]  = True
                     pos["sl_price"] = entry
                     changed = True
@@ -377,6 +422,7 @@ async def price_monitor():
                     if LIVE_TRADING and pos.get("live_tp2_qty", 0) >= 0.001:
                         await futures_order(symbol, "SELL", pos["live_tp2_qty"], reduce_only=True)
                     pnl, pnl_pct = partial_close(port, pos, pos["tp2_qty"], price, "TP2")
+                    live_record(port, pos, pos.get("live_tp2_qty", 0), price, "TP2")
                     pos["tp2_hit"]  = True
                     pos["sl_price"] = pos["tp1_price"]
                     changed = True
@@ -421,6 +467,7 @@ async def price_monitor():
                         if LIVE_TRADING and pos.get("live_tp3_qty", 0) >= 0.001:
                             await futures_order(symbol, "SELL", pos["live_tp3_qty"], reduce_only=True)
                         pnl, pnl_pct = partial_close(port, pos, pos["qty_remaining"], price, "TP3+Trail")
+                        live_record(port, pos, pos.get("live_tp3_qty", 0), price, "TP3+Trail")
                         to_remove.append(pos)
                         changed = True
                         await telegram(
@@ -718,6 +765,7 @@ async def status():
     port      = load()
     positions = port.get("positions", [])
     trades    = port.get("trades", [])
+    live_trs  = port.get("live_trades", [])
 
     live_prices = {}
     for pos in positions:
@@ -727,8 +775,20 @@ async def status():
             if p:
                 live_prices[sym] = p
 
+    # live Binance balance
+    binance_wallet, binance_avail = (None, None)
+    if LIVE_TRADING:
+        binance_wallet, binance_avail = await get_live_balance()
+
     total  = port["wins"] + port["losses"]
     wr     = (port["wins"] / total * 100) if total else 0
+
+    # live tab stats
+    live_pnl   = sum(t["pnl"] for t in live_trs)
+    live_wins  = sum(1 for t in live_trs if t["pnl"] > 0)
+    live_loss  = sum(1 for t in live_trs if t["pnl"] <= 0)
+    live_total = live_wins + live_loss
+    live_wr    = (live_wins / live_total * 100) if live_total else 0
     unreal = sum(
         ((p["entry_price"] - live_prices.get(p["symbol"], p["entry_price"])) if p.get("side") == "SHORT"
          else (live_prices.get(p["symbol"], p["entry_price"]) - p["entry_price"])) * p["qty_remaining"]
@@ -775,6 +835,18 @@ async def status():
           <td>{t.get('reason','—')}</td>
         </tr>"""
 
+    live_rows = ""
+    for t in reversed(live_trs):
+        color = "#00c853" if t["pnl"] > 0 else "#f44336"
+        live_rows += f"""<tr>
+          <td>{t.get('side','LONG')} {t.get('symbol','BTCUSDT')}</td>
+          <td>${t['entry']:,.2f}</td>
+          <td>${t['exit']:,.2f}</td>
+          <td style="color:{color}">${t['pnl']:+.2f} ({t['pnl_pct']:+.2f}%)</td>
+          <td>{t.get('reason','—')}</td>
+          <td style="opacity:0.6">{t.get('exit_time','')}</td>
+        </tr>"""
+
     unreal_color = "#00c853" if unreal >= 0 else "#f44336"
     pnl_color    = "green" if port["total_pnl"] >= 0 else ""
 
@@ -804,10 +876,33 @@ async def status():
     table {{ width:100%; border-collapse:collapse; font-size:13px; margin-top:8px }}
     th    {{ color:#8b949e; text-align:left; padding:8px; border-bottom:1px solid #30363d }}
     td    {{ padding:8px; border-bottom:1px solid #21262d }}
+    .tabs {{ display:flex; gap:8px; margin-bottom:24px }}
+    .tab  {{ padding:8px 24px; border-radius:6px; cursor:pointer; font-family:monospace;
+             font-size:14px; border:1px solid #30363d; background:#161b22; color:#8b949e }}
+    .tab.active {{ background:#58a6ff; color:#0d1117; border-color:#58a6ff; font-weight:bold }}
+    .tab-content {{ display:none }}
+    .tab-content.active {{ display:block }}
+    .live-badge {{ background:#f44336; color:white; padding:2px 8px; border-radius:4px;
+                   font-size:11px; margin-left:8px; vertical-align:middle }}
   </style>
+  <script>
+    function switchTab(name) {{
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+      document.getElementById('tab-' + name).classList.add('active');
+      document.getElementById('content-' + name).classList.add('active');
+    }}
+  </script>
 </head>
 <body>
   <h1>BTC Bot V9 Dashboard</h1>
+  <div class="tabs">
+    <button class="tab active" id="tab-sim" onclick="switchTab('sim')">Simulation</button>
+    <button class="tab" id="tab-live" onclick="switchTab('live')">🔴 Live Trading <span class="live-badge">LIVE</span></button>
+  </div>
+
+  <!-- ── SIMULATION TAB ── -->
+  <div class="tab-content active" id="content-sim">
   <div class="stats">
     <div class="stat">
       <div class="stat-label">Balance</div>
@@ -834,15 +929,50 @@ async def status():
       <div class="stat-value">{len(positions)}/{MAX_POSITIONS}</div>
     </div>
   </div>
-
   <h2>Open Positions</h2>
   <div class="cards">{cards_html}</div>
-
   <h2>All Trades</h2>
   <table>
     <tr><th>Type</th><th>Entry</th><th>Exit</th><th>P&amp;L</th><th>Reason</th></tr>
     {rows if rows else '<tr><td colspan="5" style="color:#333;text-align:center">No trades yet</td></tr>'}
   </table>
+  </div>
+
+  <!-- ── LIVE TAB ── -->
+  <div class="tab-content" id="content-live">
+  <div class="stats">
+    <div class="stat">
+      <div class="stat-label">Binance Balance</div>
+      <div class="stat-value">{"$"+f"{binance_wallet:.2f}" if binance_wallet is not None else "—"}</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Available</div>
+      <div class="stat-value">{"$"+f"{binance_avail:.2f}" if binance_avail is not None else "—"}</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Live P&amp;L</div>
+      <div class="stat-value" style="color:{'#00c853' if live_pnl >= 0 else '#f44336'}">${live_pnl:+.2f}</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Live Trades</div>
+      <div class="stat-value">{live_total}</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Win Rate</div>
+      <div class="stat-value">{live_wr:.1f}%</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Size/Trade</div>
+      <div class="stat-value">${LIVE_SIZE_USD:.0f}</div>
+    </div>
+  </div>
+  <h2>Live Trades</h2>
+  <table>
+    <tr><th>Type</th><th>Entry</th><th>Exit</th><th>P&amp;L</th><th>Reason</th><th>Time</th></tr>
+    {live_rows if live_rows else '<tr><td colspan="6" style="color:#333;text-align:center">No live trades yet</td></tr>'}
+  </table>
+  </div>
+
 </body>
 </html>"""
     return html
