@@ -897,12 +897,12 @@ async def status():
 <body>
   <h1>BTC Bot V9 Dashboard</h1>
   <div class="tabs">
-    <button class="tab active" id="tab-sim" onclick="switchTab('sim')">Simulation</button>
-    <button class="tab" id="tab-live" onclick="switchTab('live')">🔴 Live Trading <span class="live-badge">LIVE</span></button>
+    <button class="tab active" id="tab-live" onclick="switchTab('live')">🔴 Live Trading <span class="live-badge">LIVE</span></button>
+    <button class="tab" id="tab-sim" onclick="switchTab('sim')">Simulation</button>
   </div>
 
   <!-- ── SIMULATION TAB ── -->
-  <div class="tab-content active" id="content-sim">
+  <div class="tab-content" id="content-sim">
   <div class="stats">
     <div class="stat">
       <div class="stat-label">Balance</div>
@@ -939,7 +939,7 @@ async def status():
   </div>
 
   <!-- ── LIVE TAB ── -->
-  <div class="tab-content" id="content-live">
+  <div class="tab-content active" id="content-live">
   <div class="stats">
     <div class="stat">
       <div class="stat-label">Binance Balance</div>
@@ -982,6 +982,14 @@ async def my_ip():
     async with httpx.AsyncClient() as c:
         r = await c.get("https://api.ipify.org?format=json")
         return r.json()
+
+@app.get("/debug/balance")
+async def debug_balance():
+    params = _sign({})
+    async with httpx.AsyncClient(timeout=10) as c:
+        r = await c.get(f"{FUTURES_BASE}/fapi/v2/balance", params=params,
+                        headers={"X-MBX-APIKEY": BINANCE_API_KEY})
+        return {"status": r.status_code, "body": r.json()}
 
 @app.get("/")
 async def root():
