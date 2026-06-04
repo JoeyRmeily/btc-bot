@@ -64,7 +64,7 @@ async def get_live_balance():
                             headers={"X-MBX-APIKEY": BINANCE_API_KEY})
             for a in r.json():
                 if a["asset"] == "USDT":
-                    return float(a["walletBalance"]), float(a["availableBalance"])
+                    return float(a["balance"]), float(a["availableBalance"])
     except Exception:
         pass
     return None, None
