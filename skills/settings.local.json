@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Read(//c/Users/user/AppData/Local/Programs/**)",
+      "Read(//c/Users/user/AppData/Roaming/**)",
+      "Read(//c/Users/user/**)",
+      "Bash(\"/c/Users/user/AppData/Local/Microsoft/WindowsApps/python.exe\" --version)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)"
+    ]
+  }
+}
