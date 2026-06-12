@@ -36,14 +36,15 @@ def _sign(params: dict) -> dict:
     return params
 
 async def futures_order(symbol: str, side: str, qty: float, reduce_only: bool = False):
-    params = _sign({
+    p = {
         "symbol":   symbol,
         "side":     side,
         "type":     "MARKET",
         "quantity": round(qty, 3),
-    })
+    }
     if reduce_only:
-        params["reduceOnly"] = "true"
+        p["reduceOnly"] = "true"
+    params = _sign(p)
     try:
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.post(f"{FUTURES_BASE}/fapi/v1/order", params=params,
