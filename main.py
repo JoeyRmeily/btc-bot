@@ -537,15 +537,11 @@ async def webhook(request: Request):
         tp2_qty   = round((qty_total - tp1_qty) * 0.50, 6)
         tp3_qty   = round(qty_total - tp1_qty - tp2_qty, 6)
 
-        # live qty uses fixed LIVE_SIZE_USD * LEVERAGE, independent of virtual portfolio
+        # live qty: close full position at TP1 on Binance
         live_qty       = round(LIVE_SIZE_USD * LEVERAGE / price, 3) if LIVE_TRADING else 0
-        live_tp1_qty   = round(live_qty * 0.34, 3)
-        live_tp2_qty   = round((live_qty - live_tp1_qty) * 0.50, 3)
-        live_tp3_qty   = round(live_qty - live_tp1_qty - live_tp2_qty, 3)
-        if live_qty > 0 and live_tp1_qty < 0.001:
-            live_tp1_qty = live_qty
-            live_tp2_qty = 0.0
-            live_tp3_qty = 0.0
+        live_tp1_qty   = live_qty
+        live_tp2_qty   = 0.0
+        live_tp3_qty   = 0.0
 
         sl  = round(price * (1 - SL_PCT  / 100), 2)
         tp1 = round(price * (1 + TP1_PCT / 100), 2)
@@ -620,14 +616,11 @@ async def webhook(request: Request):
         tp2_qty   = round((qty_total - tp1_qty) * 0.50, 6)
         tp3_qty   = round(qty_total - tp1_qty - tp2_qty, 6)
 
+        # live qty: close full position at TP1 on Binance
         live_qty       = round(LIVE_SIZE_USD * LEVERAGE / price, 3) if LIVE_TRADING else 0
-        live_tp1_qty   = round(live_qty * 0.34, 3)
-        live_tp2_qty   = round((live_qty - live_tp1_qty) * 0.50, 3)
-        live_tp3_qty   = round(live_qty - live_tp1_qty - live_tp2_qty, 3)
-        if live_qty > 0 and live_tp1_qty < 0.001:
-            live_tp1_qty = live_qty
-            live_tp2_qty = 0.0
-            live_tp3_qty = 0.0
+        live_tp1_qty   = live_qty
+        live_tp2_qty   = 0.0
+        live_tp3_qty   = 0.0
 
         sl  = round(price * (1 + SL_PCT  / 100), 2)
         tp1 = round(price * (1 - TP1_PCT / 100), 2)
