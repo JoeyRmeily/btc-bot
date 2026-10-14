@@ -489,22 +489,302 @@ async def price_monitor():
         if changed:
             save(port)
 
+# ─── Agent signal generator ───────────────────
+# AGENT_MODE: "off" = disabled, "shadow" = Telegram analysis only, "live" = trades
+AGENT_MODE      = os.environ.get("AGENT_MODE", "shadow").lower()
+AGENT_SYMBOLS   = ["BTCUSDT"]
+MIN_AGENT_SCORE = int(os.environ.get("MIN_AGENT_SCORE", "2"))
+LAST_HALVING    = datetime(2024, 4, 20)
+SPOT_BASE       = "https://api.binance.com"
+
+agent_state: dict = {"last_bar": {}, "last_analysis": {}}
+_macro_cache: dict = {}
+
+async def fetch_klines(symbol: str, interval: str, limit: int) -> list:
+    """Closed candles only (Binance's last kline is still forming)."""
+    async with httpx.AsyncClient(timeout=10) as c:
+        r = await c.get(f"{SPOT_BASE}/api/v3/klines",
+                        params={"symbol": symbol, "interval": interval, "limit": limit + 1})
+        rows = r.json()[:-1]
+    return [{"t": k[0], "o": float(k[1]), "h": float(k[2]), "l": float(k[3]),
+             "c": float(k[4]), "v": float(k[5])} for k in rows]
+
+async def cached(key: str, ttl: int, fetch):
+    hit = _macro_cache.get(key)
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1]
+    value = await fetch()
+    _macro_cache[key] = (time.time(), value)
+    return value
+
+# ── Indicator math (matches Pine: SMA-seeded EMA, Wilder RSI/ATR) ──
+def ema(values: list, period: int) -> list:
+    if len(values) < period:
+        return [values[-1]] * len(values)
+    out = [None] * (period - 1) + [sum(values[:period]) / period]
+    k = 2 / (period + 1)
+    for v in values[period:]:
+        out.append(v * k + out[-1] * (1 - k))
+    return out
+
+def sma(values: list, period: int) -> float:
+    return sum(values[-period:]) / period
+
+def rma(values: list, period: int) -> list:
+    out = [sum(values[:period]) / period]
+    for v in values[period:]:
+        out.append((out[-1] * (period - 1) + v) / period)
+    return out
+
+def rsi(closes: list, period: int = 14) -> float:
+    diffs  = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gain   = rma([max(d, 0) for d in diffs], period)[-1]
+    loss   = rma([max(-d, 0) for d in diffs], period)[-1]
+    return 100.0 if loss == 0 else 100 - 100 / (1 + gain / loss)
+
+def session_vwap(candles: list) -> float:
+    """VWAP anchored at 00:00 UTC of the last candle's day, like Pine's ta.vwap."""
+    day_start = candles[-1]["t"] - candles[-1]["t"] % 86_400_000
+    day = [k for k in candles if k["t"] >= day_start]
+    vol = sum(k["v"] for k in day)
+    return sum((k["h"] + k["l"] + k["c"]) / 3 * k["v"] for k in day) / vol if vol else candles[-1]["c"]
+
+def atr(candles: list, period: int = 14) -> float:
+    trs = [max(k["h"] - k["l"], abs(k["h"] - p["c"]), abs(k["l"] - p["c"]))
+           for p, k in zip(candles, candles[1:])]
+    return rma(trs, period)[-1]
+
+def vote(v: int, reason: str, weight: int = 1, required: bool = False) -> dict:
+    return {"vote": v, "weight": weight, "required": required, "reason": reason}
+
+# ── Required agents: the V9 rules. All must vote +1 or no trade. ──
+def agent_ema_cross(c15: list) -> tuple:
+    closes = [k["c"] for k in c15]
+    e9, e21 = ema(closes, 9), ema(closes, 21)
+    if e9[-1] > e21[-1] and e9[-2] <= e21[-2]:
+        return "LONG", vote(1, "EMA9 crossed above EMA21", required=True)
+    if e9[-1] < e21[-1] and e9[-2] >= e21[-2]:
+        return "SHORT", vote(1, "EMA9 crossed below EMA21", required=True)
+    return None, vote(0, "No crossover", required=True)
+
+def agent_mtf(c1h: list, c4h: list, d: str) -> dict:
+    h1c, h4c = [k["c"] for k in c1h], [k["c"] for k in c4h]
+    h1_e9, h1_e21 = ema(h1c, 9)[-1], ema(h1c, 21)[-1]
+    h4_e9, h4_e21, h4_e50 = ema(h4c, 9)[-1], ema(h4c, 21)[-1], ema(h4c, 50)[-1]
+    h1_rsi, h4_rsi, h1_vwap = rsi(h1c), rsi(h4c), session_vwap(c1h)
+    if d == "LONG":
+        h1 = h1_e9 > h1_e21 and h1_rsi > 50 and h1c[-1] > h1_vwap
+        h4 = h4_e9 > h4_e21 > h4_e50 and h4_rsi > 50
+    else:
+        h1 = h1_e9 < h1_e21 and h1_rsi < 50 and h1c[-1] < h1_vwap
+        h4 = h4_e9 < h4_e21 < h4_e50 and h4_rsi < 50
+    return vote(1 if h1 and h4 else -1,
+                f"1H {'ok' if h1 else 'fail'} (RSI {h1_rsi:.0f}), 4H stack {'ok' if h4 else 'fail'} (RSI {h4_rsi:.0f})",
+                required=True)
+
+def agent_rsi(c15: list, d: str) -> dict:
+    r = rsi([k["c"] for k in c15])
+    ok = 45 <= r <= 70 if d == "LONG" else 30 <= r <= 55
+    return vote(1 if ok else -1, f"RSI {r:.1f}", required=True)
+
+def agent_vwap(c15: list, d: str) -> dict:
+    v, c = session_vwap(c15), c15[-1]["c"]
+    ok = c > v if d == "LONG" else c < v
+    return vote(1 if ok else -1, f"Close {c:,.0f} vs VWAP {v:,.0f}", required=True)
+
+def agent_volume(c15: list) -> dict:
+    vols  = [k["v"] for k in c15]
+    ratio = vols[-1] / sma(vols[:-1], 20)
+    return vote(1 if ratio >= 1.5 else -1, f"Volume {ratio:.2f}x avg", required=True)
+
+def agent_trend15(c15: list, d: str) -> dict:
+    closes = [k["c"] for k in c15]
+    e50 = ema(closes, 50)[-1]
+    ok = closes[-1] > e50 if d == "LONG" else closes[-1] < e50
+    return vote(1 if ok else -1, f"Close vs EMA50 {e50:,.0f}", required=True)
+
+# ── Scoring agents: weighted votes, summed against MIN_AGENT_SCORE ──
+def agent_macd(c15: list, d: str) -> dict:
+    closes = [k["c"] for k in c15]
+    e12, e26 = ema(closes, 12), ema(closes, 26)
+    line = [a - b for a, b in zip(e12[25:], e26[25:])]
+    hist = [m - s for m, s in zip(line[8:], ema(line, 9)[8:])]
+    up = hist[-1] > 0 and hist[-1] > hist[-2]
+    dn = hist[-1] < 0 and hist[-1] < hist[-2]
+    v = (1 if up else -1 if hist[-1] < 0 else 0) if d == "LONG" else (1 if dn else -1 if hist[-1] > 0 else 0)
+    return vote(v, f"Histogram {hist[-1]:+.1f}")
+
+def agent_bollinger(c15: list, d: str) -> dict:
+    closes = [k["c"] for k in c15][-20:]
+    mid = sum(closes) / 20
+    std = (sum((x - mid) ** 2 for x in closes) / 20) ** 0.5
+    up, lo, c = mid + 2 * std, mid - 2 * std, closes[-1]
+    if d == "LONG":
+        v = -1 if c > up else 1 if c > mid else 0
+    else:
+        v = -1 if c < lo else 1 if c < mid else 0
+    return vote(v, f"Band {lo:,.0f} / {mid:,.0f} / {up:,.0f}")
+
+def agent_obv(c15: list, d: str) -> dict:
+    obv = [0.0]
+    for p, k in zip(c15, c15[1:]):
+        obv.append(obv[-1] + (k["v"] if k["c"] > p["c"] else -k["v"] if k["c"] < p["c"] else 0))
+    rising = obv[-1] > ema(obv, 20)[-1]
+    v = 1 if rising == (d == "LONG") else -1
+    return vote(v, f"OBV {'above' if rising else 'below'} its EMA20")
+
+def agent_atr(c15: list) -> dict:
+    pct = atr(c15) / c15[-1]["c"] * 100
+    return vote(-1 if pct < 0.15 else 1 if pct >= 0.30 else 0, f"ATR {pct:.2f}% of price")
+
+def agent_200dma(daily: list, d: str) -> dict:
+    closes = [k["c"] for k in daily]
+    dma = sma(closes, 200)
+    mayer = closes[-1] / dma
+    above = closes[-1] > dma
+    return vote(1 if above == (d == "LONG") else -1,
+                f"{'Above' if above else 'Below'} 200DMA {dma:,.0f} (Mayer {mayer:.2f})", weight=2)
+
+def agent_pi_cycle(daily: list, d: str) -> dict:
+    closes = [k["c"] for k in daily]
+    if len(closes) < 350:
+        return vote(0, "Not enough daily history")
+    ratio = sma(closes, 111) / (2 * sma(closes, 350))
+    if ratio >= 1:
+        return vote(-1 if d == "LONG" else 1, f"Top signal active (ratio {ratio:.2f})")
+    return vote(0, f"No top signal (ratio {ratio:.2f})")
+
+def agent_cycle(d: str) -> dict:
+    months = (datetime.utcnow() - LAST_HALVING).days / 30.44
+    if months < 6:    phase, bias = "post-halving accumulation", 0
+    elif months < 18: phase, bias = "bull run", 1
+    elif months < 30: phase, bias = "late bull / top zone", 0
+    elif months < 42: phase, bias = "bear market", -1
+    else:             phase, bias = "bottoming", 0
+    return vote(bias if d == "LONG" else -bias, f"{phase}, {months:.0f} months after halving")
+
+def agent_fear_greed(fg: dict | None, d: str) -> dict:
+    if not fg:
+        return vote(0, "Unavailable")
+    score = fg["score"]
+    if d == "LONG" and score >= 80:
+        return vote(-1, f"{score} Extreme Greed, overheated")
+    if d == "SHORT" and score <= 20:
+        return vote(-1, f"{score} Extreme Fear, bounce risk")
+    return vote(0, f"{score} {fg['label']}")
+
+async def fetch_fear_greed():
+    try:
+        async with httpx.AsyncClient(timeout=5) as c:
+            row = (await c.get("https://api.alternative.me/fng/?limit=1")).json()["data"][0]
+        return {"score": int(row["value"]), "label": row["value_classification"]}
+    except Exception:
+        return None
+
+# ── Orchestrator ──
+async def analyze(symbol: str, force: str | None = None) -> dict:
+    """force="LONG"/"SHORT" runs every agent without a crossover (inspection only)."""
+    c15, c1h, c4h = await asyncio.gather(
+        fetch_klines(symbol, "15m", 300),
+        fetch_klines(symbol, "1h", 300),
+        fetch_klines(symbol, "4h", 300),
+    )
+    bar = c15[-1]["t"]
+    direction, trigger = agent_ema_cross(c15)
+    if not direction and force:
+        direction = force
+    result = {"symbol": symbol, "bar": bar, "close": c15[-1]["c"], "direction": direction,
+              "agents": {"EMA Cross": trigger}, "fire": False, "gate": False, "score": 0}
+    if not direction:
+        return result
+
+    daily = await cached(f"daily:{symbol}", 3600, lambda: fetch_klines(symbol, "1d", 400))
+    fg    = await cached("fng", 3600, fetch_fear_greed)
+    result["agents"].update({
+        "MTF 1H/4H":   agent_mtf(c1h, c4h, direction),
+        "RSI":         agent_rsi(c15, direction),
+        "VWAP":        agent_vwap(c15, direction),
+        "Volume":      agent_volume(c15),
+        "EMA50 trend": agent_trend15(c15, direction),
+        "MACD":        agent_macd(c15, direction),
+        "Bollinger":   agent_bollinger(c15, direction),
+        "OBV":         agent_obv(c15, direction),
+        "ATR":         agent_atr(c15),
+        "200DMA":      agent_200dma(daily, direction),
+        "Pi Cycle":    agent_pi_cycle(daily, direction),
+        "Halving":     agent_cycle(direction),
+        "Fear/Greed":  agent_fear_greed(fg, direction),
+    })
+    gate  = all(a["vote"] == 1 for a in result["agents"].values() if a["required"])
+    score = sum(a["vote"] * a["weight"] for a in result["agents"].values() if not a["required"])
+    result.update(gate=gate, score=score, fire=gate and score >= MIN_AGENT_SCORE)
+    return result
+
+def format_analysis(r: dict) -> str:
+    lines = []
+    for name, a in r["agents"].items():
+        icon = "✅" if a["vote"] > 0 else "❌" if a["vote"] < 0 else "➖"
+        tag  = " 🔒" if a["required"] else f" ({a['vote'] * a['weight']:+d})"
+        lines.append(f"{icon} {name}{tag}: {a['reason']}")
+    verdict = ("🟢 <b>SIGNAL FIRED</b>" if r["fire"]
+               else "🔴 <b>BLOCKED</b> — V9 rule failed" if not r["gate"]
+               else f"🔴 <b>BLOCKED</b> — score below {MIN_AGENT_SCORE}")
+    return (f"🤖 <b>Agents — {r['direction']} {r['symbol']}</b> [{AGENT_MODE.upper()}]\n"
+            f"━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines) +
+            f"\n━━━━━━━━━━━━━━━━━━\n📊 Score: <b>{r['score']:+d}</b> (need {MIN_AGENT_SCORE:+d}, 🔒 = must pass)\n{verdict}")
+
+async def run_agents(symbol: str):
+    r = await analyze(symbol)
+    if agent_state["last_bar"].get(symbol) == r["bar"]:
+        return
+    agent_state["last_bar"][symbol] = r["bar"]
+    agent_state["last_analysis"][symbol] = r
+    if not r["direction"]:
+        return
+    await telegram(format_analysis(r))
+    if r["fire"] and AGENT_MODE == "live":
+        price = price_cache.get(symbol) or await get_price(symbol) or r["close"]
+        await process_signal({
+            "secret": SECRET,
+            "signal": "buy" if r["direction"] == "LONG" else "short",
+            "price":  str(price),
+            "symbol": symbol,
+            "score":  str(r["score"]),
+        })
+
+async def signal_generator():
+    if AGENT_MODE == "off":
+        return
+    await telegram(f"🤖 Agent signal generator started — mode: <b>{AGENT_MODE.upper()}</b>, min score {MIN_AGENT_SCORE:+d}")
+    while True:
+        # wake 10s after each 15m candle closes
+        await asyncio.sleep(900 - time.time() % 900 + 10)
+        for symbol in AGENT_SYMBOLS:
+            try:
+                await run_agents(symbol)
+            except Exception as e:
+                await telegram(f"⚠️ Agent error ({symbol}): {e}")
+
 @asynccontextmanager
 async def lifespan(_app):
     if LIVE_TRADING:
         await init_futures()
     ws_task      = asyncio.create_task(ws_price_feed())
     monitor_task = asyncio.create_task(price_monitor())
+    agent_task   = asyncio.create_task(signal_generator())
     yield
     ws_task.cancel()
     monitor_task.cancel()
+    agent_task.cancel()
 
 app = FastAPI(lifespan=lifespan)
 
 # ─── Webhook ──────────────────────────────────
 @app.post("/webhook")
 async def webhook(request: Request):
-    data   = await request.json()
+    return await process_signal(await request.json())
+
+async def process_signal(data: dict):
     if data.get("secret") != SECRET:
         return {"status": "unauthorized"}
 
@@ -760,6 +1040,15 @@ async def seed(request: Request):
         return {"status": "unauthorized"}
     save(data["portfolio"])
     return {"status": "seeded"}
+
+# ─── Agents (read-only, never trades) ─────────
+@app.get("/agents")
+async def agents_now(symbol: str = "BTCUSDT", force: str = ""):
+    """Current agent view. ?force=LONG or SHORT runs every agent even without a crossover."""
+    f = force.upper() if force.upper() in ("LONG", "SHORT") else None
+    r = await analyze(symbol, f)
+    return {"mode": AGENT_MODE, "min_score": MIN_AGENT_SCORE, "analysis": r,
+            "last_fired_check": agent_state["last_analysis"].get(symbol)}
 
 # ─── Dashboard ────────────────────────────────
 @app.get("/status", response_class=HTMLResponse)
