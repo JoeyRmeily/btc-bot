@@ -42,7 +42,8 @@ curl -X POST localhost:8000/webhook -H "Content-Type: application/json" \
 | `LIVE_TRADING` | `false` | `true` = real Binance orders and real money |
 | `BINANCE_API_KEY` / `BINANCE_SECRET_KEY` | `""` | Server IP must be whitelisted on Binance |
 | `LIVE_SIZE_USD` | `100` | Margin per live trade |
-| `AGENT_MODE` | `shadow` | `off` / `shadow` (Telegram only) / `live` (agents place trades) |
+| `STRATEGY_MODE` | `shadow` | Strategy engine: `shadow` (paper + Telegram) / `off` |
+| `AGENT_MODE` | `off` | Retired 15m agents: `off` / `shadow` / `live` |
 | `MIN_AGENT_SCORE` | `2` | Scoring-agent threshold, range -9..+9 |
 
 Env vars live in `/root/btc-bot/.env` (loaded via `EnvironmentFile=` in the systemd unit; untracked by git). After editing it, run `systemctl restart btc-bot`. When inspecting it, print names only (`cut -d= -f1 .env`), never values.

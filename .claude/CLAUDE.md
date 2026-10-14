@@ -22,5 +22,6 @@ The Pine Script strategy lives in TradingView, not this repo.
 @rules/architecture.md
 @rules/deployment.md
 @rules/binance.md
+@rules/strategies.md
 @rules/strategy.md
 @rules/agents.md

@@ -4,8 +4,9 @@ Single-file FastAPI app (`main.py`). No modules, no tests.
 
 ## Request flow
 ```
-signal_generator (every 15m close) → analyze() → agents vote
-                                   → process_signal() if AGENT_MODE=live (see agents.md)
+strategy_engine (60s tick) → Trend 4H on 9 coins + BTC funding capitulation
+                           → paper positions in strategies.json + Telegram (see strategies.md)
+signal_generator (retired, AGENT_MODE=off) → analyze() → agents vote (see agents.md)
 TradingView alert → POST /webhook → process_signal()
 process_signal() → open/close sim + live position → Telegram
 price_monitor (1s loop) → checks price_cache against TP/SL levels
@@ -32,6 +33,7 @@ The exit ladder in `price_monitor` has separate mirrored blocks for LONG and SHO
 |----------|-------|
 | `GET /status` | HTML dashboard; Live tab default, Simulation tab |
 | `POST /webhook` | TradingView alerts |
+| `GET /strategies` | Strategy engine paper positions, per-strategy summary, last 50 closed trades |
 | `GET /agents` | Fresh agent analysis, read-only; `?force=LONG` / `?force=SHORT` runs all agents without a crossover |
 | `POST /reset-trades` | Reset sim portfolio — no auth |
 | `POST /admin/seed` | Replace portfolio — requires `secret` |

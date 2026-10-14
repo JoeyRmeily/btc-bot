@@ -1,6 +1,8 @@
-# Agent Signal Generator
+# Agent Signal Generator (retired) and research log
 
-Built into `main.py` (section `# ─── Agent signal generator ───`). It replaces TradingView as the signal source. The `/webhook` endpoint still works, so a TradingView alert and the agents can run side by side, but never point both at live trading at once or every signal doubles.
+**Retired:** `AGENT_MODE` defaults to `off` because backtests found no edge. The live signal source is now the strategy engine (strategies.md). The agent code stays because `backtest.py` uses `evaluate()`. The "Findings" section below is the research log behind the current strategies.
+
+Built into `main.py` (section `# ─── Agent signal generator ───`). The `/webhook` endpoint still works, so a TradingView alert and the agents can run side by side, but never point both at live trading at once or every signal doubles.
 
 ## Loop
 `signal_generator()` wakes 10s after every 15m candle close, runs `analyze()` for each symbol in `AGENT_SYMBOLS`, and dedupes by candle open time (`agent_state["last_bar"]`). Telegram gets a full agent report **only when the EMA crossover fires**, which happens a few times a day at most.

@@ -1,5 +1,6 @@
 .env
 portfolio.json
+strategies.json
 __pycache__/
 venv/
 .backtest_cache/

@@ -496,7 +496,7 @@ async def price_monitor():
 
 # ─── Agent signal generator ───────────────────
 # AGENT_MODE: "off" = disabled, "shadow" = Telegram analysis only, "live" = trades
-AGENT_MODE      = os.environ.get("AGENT_MODE", "shadow").lower()
+AGENT_MODE      = os.environ.get("AGENT_MODE", "off").lower()
 AGENT_SYMBOLS   = ["BTCUSDT"]
 MIN_AGENT_SCORE = int(os.environ.get("MIN_AGENT_SCORE", "2"))
 LAST_HALVING    = datetime(2024, 4, 20)
@@ -775,6 +775,148 @@ async def signal_generator():
             except Exception as e:
                 await telegram(f"⚠️ Agent error ({symbol}): {e}")
 
+# ─── Strategy engine (validated strategies) ───
+# Backtested in .claude/rules/agents.md. STRATEGY_MODE: "off" | "shadow" (paper + Telegram, no orders)
+STRATEGY_MODE  = os.environ.get("STRATEGY_MODE", "shadow").lower()
+TREND_COINS    = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+                  "DOGEUSDT", "ADAUSDT", "LINKUSDT", "AVAXUSDT"]
+STRATEGY_FILE  = "strategies.json"
+STRAT_LEVERAGE = 2
+STRAT_FEE_PCT  = 0.1
+FUNDING_HOLD_H = 72
+
+def px(p: float) -> str:
+    return f"{p:,.2f}" if p >= 100 else f"{p:.4g}"
+
+def load_strat() -> dict:
+    if os.path.exists(STRATEGY_FILE):
+        with open(STRATEGY_FILE) as f:
+            return json.load(f)
+    return {"positions": {}, "trades": [], "last_4h": 0, "last_funding": 0}
+
+def save_strat(s: dict):
+    with open(STRATEGY_FILE, "w") as f:
+        json.dump(s, f, indent=2)
+
+def trend_signal(c4: list, d1: list) -> tuple:
+    """Long while 4H EMA20 > EMA50 and the last closed daily close > daily SMA200."""
+    closes = [k["c"] for k in c4]
+    e20, e50 = ema(closes, 20)[-1], ema(closes, 50)[-1]
+    dc = [k["c"] for k in d1]
+    sma200 = sma(dc, 200)
+    ok = e20 > e50 and dc[-1] > sma200
+    return ok, (f"4H EMA20 {'above' if e20 > e50 else 'below'} EMA50, "
+                f"daily close {'above' if dc[-1] > sma200 else 'below'} SMA200 ${px(sma200)}")
+
+async def fetch_funding(symbol: str, days: int = 215) -> list:
+    # Without startTime Binance returns at most 500 prints regardless of limit; we need ~545.
+    start = int((time.time() - days * 86_400) * 1000)
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.get(f"{FUTURES_BASE}/fapi/v1/fundingRate",
+                        params={"symbol": symbol, "startTime": start, "limit": 1000})
+    return [float(x["fundingRate"]) for x in r.json()]
+
+def capitulation_signal(rates: list) -> tuple:
+    """F = mean of last 3 prints. Fire when F < 0 and F < 10th pct of the prior 540 F values (180 days)."""
+    F = [sum(rates[i - 2:i + 1]) / 3 for i in range(2, len(rates))]
+    if len(F) < 541:
+        return False, F[-1], None
+    threshold = sorted(F[-541:-1])[54]
+    return F[-1] < 0 and F[-1] < threshold, F[-1], threshold
+
+async def live_price(symbol: str) -> float | None:
+    return price_cache.get(symbol) or await get_price(symbol)
+
+def strat_open(s: dict, key: str, symbol: str, strategy: str, price: float, reason: str, **extra) -> str:
+    s["positions"][key] = {"symbol": symbol, "strategy": strategy, "entry": price,
+                           "time": int(time.time() * 1000), "reason": reason, **extra}
+    return f"🟢 <b>BUY {symbol}</b> @ ${px(price)}\n   {reason}"
+
+def strat_close(s: dict, key: str, price: float, reason: str) -> str:
+    pos = s["positions"].pop(key)
+    pct = (price / pos["entry"] - 1) * 100 - STRAT_FEE_PCT
+    s["trades"].append({"symbol": pos["symbol"], "strategy": pos["strategy"], "entry": pos["entry"],
+                        "exit": price, "opened": pos["time"], "closed": int(time.time() * 1000),
+                        "pnl_pct": round(pct, 2), "pnl_lev_pct": round(pct * STRAT_LEVERAGE, 2), "reason": reason})
+    mine = [t for t in s["trades"] if t["strategy"] == pos["strategy"]]
+    wr = 100 * sum(t["pnl_pct"] > 0 for t in mine) / len(mine)
+    icon = "✅" if pct > 0 else "❌"
+    return (f"{icon} <b>SELL {pos['symbol']}</b> @ ${px(price)}  {pct:+.2f}% "
+            f"({pct * STRAT_LEVERAGE:+.2f}% at {STRAT_LEVERAGE}x)\n   {reason}\n"
+            f"   {pos['strategy']}: {len(mine)} trades, {wr:.0f}% wins")
+
+async def run_trend(s: dict) -> list:
+    lines = []
+    for symbol in TREND_COINS:
+        try:
+            c4, d1 = await asyncio.gather(fetch_klines(symbol, "4h", 300), fetch_klines(symbol, "1d", 210))
+            ok, reason = trend_signal(c4, d1)
+            key = f"trend:{symbol}"
+            if ok and key not in s["positions"]:
+                price = await live_price(symbol)
+                if price:
+                    lines.append(strat_open(s, key, symbol, "Trend 4H", price, reason))
+            elif not ok and key in s["positions"]:
+                price = await live_price(symbol)
+                if price:
+                    lines.append(strat_close(s, key, price, reason))
+        except Exception as e:
+            lines.append(f"⚠️ Trend check failed for {symbol}: {e}")
+    return lines
+
+async def run_capitulation(s: dict) -> list:
+    key = "funding:BTCUSDT"
+    if key in s["positions"]:
+        return []
+    ok, F, threshold = capitulation_signal(await fetch_funding("BTCUSDT"))
+    if not ok:
+        return []
+    price = await live_price("BTCUSDT")
+    c4 = await fetch_klines("BTCUSDT", "4h", 120)
+    stop = price - 3 * atr(c4)
+    reason = (f"24h avg funding {F * 100:.4f}% is below its 180-day 10th percentile "
+              f"({threshold * 100:.4f}%). Stop ${px(stop)}, exit in {FUNDING_HOLD_H}h")
+    return [strat_open(s, key, "BTCUSDT", "Funding capitulation", price, reason,
+                       stop=stop, exit_at=int(time.time() * 1000) + FUNDING_HOLD_H * 3_600_000)]
+
+async def check_funding_exits(s: dict) -> list:
+    lines = []
+    for key in [k for k in s["positions"] if k.startswith("funding:")]:
+        pos = s["positions"][key]
+        price = await live_price(pos["symbol"])
+        if not price:
+            continue
+        if price <= pos["stop"]:
+            lines.append(strat_close(s, key, price, "Stop loss hit (3x ATR)"))
+        elif time.time() * 1000 >= pos["exit_at"]:
+            lines.append(strat_close(s, key, price, f"{FUNDING_HOLD_H}h time exit"))
+    return lines
+
+async def strategy_engine():
+    if STRATEGY_MODE == "off":
+        return
+    s = load_strat()
+    await telegram(f"📈 Strategy engine started — mode: <b>{STRATEGY_MODE.upper()}</b>\n"
+                   f"Trend 4H on {len(TREND_COINS)} coins + BTC funding capitulation\n"
+                   f"Open paper positions: {len(s['positions'])}")
+    while True:
+        try:
+            now, lines = time.time(), []
+            if int(now // 14_400) != s["last_4h"] and now % 14_400 > 30:
+                lines += await run_trend(s)
+                s["last_4h"] = int(now // 14_400)
+            if int(now // 28_800) != s["last_funding"] and now % 28_800 > 60:
+                lines += await run_capitulation(s)
+                s["last_funding"] = int(now // 28_800)
+            lines += await check_funding_exits(s)
+            save_strat(s)
+            if lines:
+                await telegram(f"📈 <b>Strategy update</b> [{STRATEGY_MODE.upper()}]\n━━━━━━━━━━━━━━━━━━\n"
+                               + "\n\n".join(lines))
+        except Exception as e:
+            await telegram(f"⚠️ Strategy engine error: {e}")
+        await asyncio.sleep(60)
+
 @asynccontextmanager
 async def lifespan(_app):
     if LIVE_TRADING:
@@ -782,10 +924,12 @@ async def lifespan(_app):
     ws_task      = asyncio.create_task(ws_price_feed())
     monitor_task = asyncio.create_task(price_monitor())
     agent_task   = asyncio.create_task(signal_generator())
+    strat_task   = asyncio.create_task(strategy_engine())
     yield
     ws_task.cancel()
     monitor_task.cancel()
     agent_task.cancel()
+    strat_task.cancel()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -1050,6 +1194,26 @@ async def seed(request: Request):
         return {"status": "unauthorized"}
     save(data["portfolio"])
     return {"status": "seeded"}
+
+# ─── Strategies (paper positions and results) ──
+@app.get("/strategies")
+async def strategies_now():
+    s = load_strat()
+    open_pos = []
+    for key, p in s["positions"].items():
+        price = await live_price(p["symbol"])
+        pct = (price / p["entry"] - 1) * 100 if price else None
+        open_pos.append({**p, "key": key, "price": price,
+                         "unrealized_pct": round(pct, 2) if pct is not None else None})
+    summary = {}
+    for t in s["trades"]:
+        g = summary.setdefault(t["strategy"], {"trades": 0, "wins": 0, "total_pct": 0.0})
+        g["trades"] += 1; g["wins"] += t["pnl_pct"] > 0; g["total_pct"] += t["pnl_pct"]
+    for g in summary.values():
+        g["win_rate"] = round(100 * g["wins"] / g["trades"], 1)
+        g["total_pct"] = round(g["total_pct"], 2)
+    return {"mode": STRATEGY_MODE, "leverage": STRAT_LEVERAGE, "open": open_pos,
+            "summary": summary, "closed": s["trades"][-50:]}
 
 # ─── Agents (read-only, never trades) ─────────
 @app.get("/agents")
