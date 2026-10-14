@@ -1,0 +1,7 @@
+.env
+portfolio.json
+__pycache__/
+venv/
+.backtest_cache/
+backtest_results.csv
+.claude/settings.local.json

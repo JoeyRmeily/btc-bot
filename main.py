@@ -659,8 +659,8 @@ def agent_pi_cycle(daily: list, d: str) -> dict:
         return vote(-1 if d == "LONG" else 1, f"Top signal active (ratio {ratio:.2f})")
     return vote(0, f"No top signal (ratio {ratio:.2f})")
 
-def agent_cycle(d: str) -> dict:
-    months = (datetime.utcnow() - LAST_HALVING).days / 30.44
+def agent_cycle(d: str, now: datetime | None = None) -> dict:
+    months = ((now or datetime.utcnow()) - LAST_HALVING).days / 30.44
     if months < 6:    phase, bias = "post-halving accumulation", 0
     elif months < 18: phase, bias = "bull run", 1
     elif months < 30: phase, bias = "late bull / top zone", 0
@@ -687,24 +687,16 @@ async def fetch_fear_greed():
         return None
 
 # ── Orchestrator ──
-async def analyze(symbol: str, force: str | None = None) -> dict:
-    """force="LONG"/"SHORT" runs every agent without a crossover (inspection only)."""
-    c15, c1h, c4h = await asyncio.gather(
-        fetch_klines(symbol, "15m", 300),
-        fetch_klines(symbol, "1h", 300),
-        fetch_klines(symbol, "4h", 300),
-    )
-    bar = c15[-1]["t"]
+def evaluate(symbol: str, c15: list, c1h: list, c4h: list, daily: list | None, fg: dict | None,
+             force: str | None = None, now: datetime | None = None) -> dict:
+    """Pure agent vote on closed candles. Shared by the live loop and backtest.py."""
     direction, trigger = agent_ema_cross(c15)
     if not direction and force:
         direction = force
-    result = {"symbol": symbol, "bar": bar, "close": c15[-1]["c"], "direction": direction,
+    result = {"symbol": symbol, "bar": c15[-1]["t"], "close": c15[-1]["c"], "direction": direction,
               "agents": {"EMA Cross": trigger}, "fire": False, "gate": False, "score": 0}
     if not direction:
         return result
-
-    daily = await cached(f"daily:{symbol}", 3600, lambda: fetch_klines(symbol, "1d", 400))
-    fg    = await cached("fng", 3600, fetch_fear_greed)
     result["agents"].update({
         "MTF 1H/4H":   agent_mtf(c1h, c4h, direction),
         "RSI":         agent_rsi(c15, direction),
@@ -717,13 +709,26 @@ async def analyze(symbol: str, force: str | None = None) -> dict:
         "ATR":         agent_atr(c15),
         "200DMA":      agent_200dma(daily, direction),
         "Pi Cycle":    agent_pi_cycle(daily, direction),
-        "Halving":     agent_cycle(direction),
+        "Halving":     agent_cycle(direction, now),
         "Fear/Greed":  agent_fear_greed(fg, direction),
     })
     gate  = all(a["vote"] == 1 for a in result["agents"].values() if a["required"])
     score = sum(a["vote"] * a["weight"] for a in result["agents"].values() if not a["required"])
     result.update(gate=gate, score=score, fire=gate and score >= MIN_AGENT_SCORE)
     return result
+
+async def analyze(symbol: str, force: str | None = None) -> dict:
+    """force="LONG"/"SHORT" runs every agent without a crossover (inspection only)."""
+    c15, c1h, c4h = await asyncio.gather(
+        fetch_klines(symbol, "15m", 300),
+        fetch_klines(symbol, "1h", 300),
+        fetch_klines(symbol, "4h", 300),
+    )
+    daily = fg = None
+    if force or agent_ema_cross(c15)[0]:
+        daily = await cached(f"daily:{symbol}", 3600, lambda: fetch_klines(symbol, "1d", 400))
+        fg    = await cached("fng", 3600, fetch_fear_greed)
+    return evaluate(symbol, c15, c1h, c4h, daily, fg, force)
 
 def format_analysis(r: dict) -> str:
     lines = []

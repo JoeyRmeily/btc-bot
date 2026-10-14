@@ -45,7 +45,16 @@ Every agent returns `vote(v, reason, weight, required)` with `v` in {-1, 0, +1}.
 - Telegram uses `parse_mode=HTML`. Never put a bare `&`, `<` or `>` in an agent name or reason. Telegram rejects the message and `telegram()` fails silently.
 - `/agents` (GET) runs a fresh analysis and never trades. `?force=LONG` or `?force=SHORT` runs every agent without a crossover, which is the easiest way to check them.
 
+## Backtesting
+`python backtest.py --months 12` replays history through `evaluate()` (the same function the live loop uses, so keep agent logic inside `evaluate()` and never fork it). Exits mirror live: full close at TP1, SL checked first when a candle touches both, 0.1% round-trip fees. Data is cached in `.backtest_cache/` and every crossover is written to `backtest_results.csv`.
+
+### Findings (2026-10-14, 3 years / 4,933 crossovers, train 24 months / test 12 months)
+- Unfiltered win rate tracks the random-walk value `SL / (TP + SL)` for every TP/SL pair, and every pair has negative expectancy after fees. **15m EMA crossovers carry no edge on BTC.**
+- V9 rules (12 months): 43.1% WR, PF 0.90. The 4H filter did worse when it passed (39%) than when it failed (43%).
+- Greedy filter search reached 65–84% WR on train and collapsed to coin-flip or zero trades on test. That is overfitting.
+- **Rules:** judge any change on expectancy and profit factor, not win rate, because WR can be bought by shrinking TP. Always validate out of sample. Do not report in-sample results as improvements.
+
 ## Not built yet
-- News/social agents (CryptoPanic, LunarCrush): planned Phase 3.
+- News/social agents (CryptoPanic, LunarCrush).
 - Candlestick-pattern agent.
-- A backtester that replays history through `analyze()` to calibrate `MIN_AGENT_SCORE`. Until it exists, the threshold is a guess, so tune it from shadow-mode reports.
+- Higher-timeframe and derivatives-data signals (funding rate, open interest). This is the most promising research direction given the findings above.
