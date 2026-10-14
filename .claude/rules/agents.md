@@ -52,6 +52,9 @@ Every agent returns `vote(v, reason, weight, required)` with `v` in {-1, 0, +1}.
 - Unfiltered win rate tracks the random-walk value `SL / (TP + SL)` for every TP/SL pair, and every pair has negative expectancy after fees. **15m EMA crossovers carry no edge on BTC.**
 - V9 rules (12 months): 43.1% WR, PF 0.90. The 4H filter did worse when it passed (39%) than when it failed (43%).
 - Greedy filter search reached 65–84% WR on train and collapsed to coin-flip or zero trades on test. That is overfitting.
+- Adaptive exits (ATR-sized stop with 2–5R target, ATR trailing, swing-low stops) on V9-gated trades looked profitable on 2023–26 train and test (PF 1.26–1.36), then **failed on unseen 2020–23** (PF 0.61–1.00). That was a false positive from picking the best of ~40 configs.
+- Support/resistance (1H swing pivots, 30-day lookback; bounce and breakout, long and short, ±trend filter, target = next level with ≥2R): 24–29% WR against a ~33% break-even, PF 0.5–0.9 in nearly every 2-year window from 2020 to 2026. No edge.
+- **Conclusion so far:** price-only rules on BTC 15m (EMA, RSI, VWAP, volume, MACD, BB, OBV, ATR, S/R, any TP/SL) show no durable edge. Next research needs different information: derivatives positioning (funding rate, open interest) or higher-timeframe trend following.
 - **Rules:** judge any change on expectancy and profit factor, not win rate, because WR can be bought by shrinking TP. Always validate out of sample. Do not report in-sample results as improvements.
 
 ## Not built yet
