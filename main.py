@@ -4,8 +4,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 import httpx, json, os, asyncio, websockets, hmac, hashlib, time
 
-TELEGRAM_TOKEN   = "8635147020:AAGxhQLIJQfN7FUWGr-3gcQam7uORywuesQ"
-TELEGRAM_CHAT_ID = "6623057612"
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "6623057612")
 SECRET           = "btcbot2024"
 PORTFOLIO_FILE   = "portfolio.json"
 STARTING_BALANCE = 1000.0
@@ -144,9 +144,14 @@ def save(p):
 # ─── Telegram ─────────────────────────────────
 async def telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    async with httpx.AsyncClient() as c:
-        await c.post(url, json={"chat_id": TELEGRAM_CHAT_ID,
-                                "text": msg, "parse_mode": "HTML"})
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(url, json={"chat_id": TELEGRAM_CHAT_ID,
+                                        "text": msg, "parse_mode": "HTML"})
+        if not r.json().get("ok"):
+            print(f"TELEGRAM FAILED: {r.json().get('description')} | {msg[:80]!r}", flush=True)
+    except Exception as e:
+        print(f"TELEGRAM ERROR: {e} | {msg[:80]!r}", flush=True)
 
 # ─── Live price ───────────────────────────────
 price_cache: dict[str, float] = {}

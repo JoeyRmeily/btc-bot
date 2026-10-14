@@ -15,6 +15,7 @@ systemctl status btc-bot   # confirm active (running)
 
 ## Useful server commands
 ```bash
+journalctl -u btc-bot | grep TELEGRAM                      # failed Telegram sends
 journalctl -u btc-bot -f --no-pager                        # live logs
 journalctl -u btc-bot --since "1 hour ago" --no-pager      # recent logs
 cat /root/btc-bot/portfolio.json | python3 -m json.tool    # current state
@@ -36,6 +37,8 @@ curl -X POST localhost:8000/webhook -H "Content-Type: application/json" \
 ## Environment variables (set in DigitalOcean)
 | Var | Default | Notes |
 |-----|---------|-------|
+| `TELEGRAM_TOKEN` | `""` | **Required.** From @BotFather. Never hardcode or commit it: a token pushed to GitHub gets auto-revoked, which silently killed every notification once already |
+| `TELEGRAM_CHAT_ID` | `6623057612` | |
 | `LIVE_TRADING` | `false` | `true` = real Binance orders and real money |
 | `BINANCE_API_KEY` / `BINANCE_SECRET_KEY` | `""` | Server IP must be whitelisted on Binance |
 | `LIVE_SIZE_USD` | `100` | Margin per live trade |
