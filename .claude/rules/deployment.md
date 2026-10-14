@@ -45,7 +45,12 @@ curl -X POST localhost:8000/webhook -H "Content-Type: application/json" \
 | `AGENT_MODE` | `shadow` | `off` / `shadow` (Telegram only) / `live` (agents place trades) |
 | `MIN_AGENT_SCORE` | `2` | Scoring-agent threshold, range -9..+9 |
 
-Find where env vars are set with `systemctl cat btc-bot`: look for `Environment=` or `EnvironmentFile=` lines. After changing them, run `systemctl daemon-reload && systemctl restart btc-bot`.
+Env vars live in `/root/btc-bot/.env` (loaded via `EnvironmentFile=` in the systemd unit; untracked by git). After editing it, run `systemctl restart btc-bot`. When inspecting it, print names only (`cut -d= -f1 .env`), never values.
+
+Claude has passwordless SSH from the user's PC (key `~/.ssh/id_ed25519`), so it can run server commands directly:
+`ssh -o BatchMode=yes root@188.166.77.144 "<command>"`. Avoid complex quoting through PowerShell: scp a script to `/tmp` and run it with `/root/btc-bot/venv/bin/python3`.
+
+Telegram bot is `@IamJR_bot`. Server→Telegram requests occasionally time out, so use timeouts ≥10s.
 
 Check the agents on the server: `curl -s "localhost/agents?force=LONG" | python3 -m json.tool`
 
