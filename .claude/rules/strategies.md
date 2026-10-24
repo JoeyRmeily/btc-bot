@@ -13,10 +13,12 @@ Both strategies passed multi-period backtests. The evidence and caveats are in a
 Expected from backtests: about 120 trades/yr in total. Trend wins ~30% of trades with PF ~2; capitulation wins ~55% with PF ~1.5–1.8 (BTC numbers are optimistic; it was weaker on ETH).
 
 ## Loop
-`strategy_engine()` ticks every 60s:
-- **Trend** runs once per 4H bucket, 30s after the candle closes (`last_4h`).
-- **Capitulation** runs once per 8H bucket, 60s after the funding print (`last_funding`). Funding prints land at 00/08/16 UTC, which align with epoch 8H buckets.
-- **Funding exits** (stop or 72h) are checked every tick using `live_price()`, which reads the BTC WebSocket cache and falls back to REST for other symbols.
+`strategy_engine()` ticks every **1s** (after an exception it backs off 60s so Telegram isn't spammed):
+- **Trend** runs once per 4H bucket, `SIGNAL_DELAY_S` (2s) after the candle closes (`last_4h`). All 9 coins are fetched in parallel (`asyncio.gather`).
+- **Capitulation** runs once per 8H bucket, 2s after the funding print (`last_funding`). If Binance hasn't published the new print yet (latest `fundingTime` < bucket start − 60s), it retries every 5s and gives up after 15 min. Funding prints land at 00/08/16 UTC, which align with epoch 8H buckets.
+- **Funding exits** (stop or 72h) are checked every tick using `live_price()`, which reads the BTC WebSocket cache (no network) and falls back to REST for other symbols. `strategies.json` is only written when something changed.
+- `fetch_klines()` keeps candles whose close time (`k[6]`) is in the past, rather than blindly dropping the last row. That makes it safe to call 2s after a boundary.
+- In live mode, the funding stop should become a real Binance stop order, so it triggers on the exchange with zero delay.
 
 Events from one tick are batched into a single Telegram message.
 

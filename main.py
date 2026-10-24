@@ -510,7 +510,8 @@ async def fetch_klines(symbol: str, interval: str, limit: int) -> list:
     async with httpx.AsyncClient(timeout=10) as c:
         r = await c.get(f"{SPOT_BASE}/api/v3/klines",
                         params={"symbol": symbol, "interval": interval, "limit": limit + 1})
-        rows = r.json()[:-1]
+    now_ms = int(time.time() * 1000)
+    rows = [k for k in r.json() if k[6] < now_ms][-limit:]  # k[6] = close time
     return [{"t": k[0], "o": float(k[1]), "h": float(k[2]), "l": float(k[3]),
              "c": float(k[4]), "v": float(k[5])} for k in rows]
 
@@ -784,6 +785,8 @@ STRATEGY_FILE  = "strategies.json"
 STRAT_LEVERAGE = 2
 STRAT_FEE_PCT  = 0.1
 FUNDING_HOLD_H = 72
+SIGNAL_DELAY_S = 2    # seconds after a 4H close / funding print before checking
+_funding_retry_at = 0.0
 
 def px(p: float) -> str:
     return f"{p:,.2f}" if p >= 100 else f"{p:.4g}"
@@ -809,12 +812,12 @@ def trend_signal(c4: list, d1: list) -> tuple:
                 f"daily close {'above' if dc[-1] > sma200 else 'below'} SMA200 ${px(sma200)}")
 
 async def fetch_funding(symbol: str, days: int = 215) -> list:
-    # Without startTime Binance returns at most 500 prints regardless of limit; we need ~545.
+    """[(fundingTime ms, rate)]. Without startTime Binance caps at 500 prints; we need ~545."""
     start = int((time.time() - days * 86_400) * 1000)
     async with httpx.AsyncClient(timeout=15) as c:
         r = await c.get(f"{FUTURES_BASE}/fapi/v1/fundingRate",
                         params={"symbol": symbol, "startTime": start, "limit": 1000})
-    return [float(x["fundingRate"]) for x in r.json()]
+    return [(int(x["fundingTime"]), float(x["fundingRate"])) for x in r.json()]
 
 def capitulation_signal(rates: list) -> tuple:
     """F = mean of last 3 prints. Fire when F < 0 and F < 10th pct of the prior 540 F values (180 days)."""
@@ -845,39 +848,44 @@ def strat_close(s: dict, key: str, price: float, reason: str) -> str:
             f"({pct * STRAT_LEVERAGE:+.2f}% at {STRAT_LEVERAGE}x)\n   {reason}\n"
             f"   {pos['strategy']}: {len(mine)} trades, {wr:.0f}% wins")
 
+async def trend_check(symbol: str) -> tuple:
+    c4, d1 = await asyncio.gather(fetch_klines(symbol, "4h", 300), fetch_klines(symbol, "1d", 210))
+    ok, reason = trend_signal(c4, d1)
+    return ok, reason, await live_price(symbol)
+
 async def run_trend(s: dict) -> list:
     lines = []
-    for symbol in TREND_COINS:
-        try:
-            c4, d1 = await asyncio.gather(fetch_klines(symbol, "4h", 300), fetch_klines(symbol, "1d", 210))
-            ok, reason = trend_signal(c4, d1)
-            key = f"trend:{symbol}"
-            if ok and key not in s["positions"]:
-                price = await live_price(symbol)
-                if price:
-                    lines.append(strat_open(s, key, symbol, "Trend 4H", price, reason))
-            elif not ok and key in s["positions"]:
-                price = await live_price(symbol)
-                if price:
-                    lines.append(strat_close(s, key, price, reason))
-        except Exception as e:
-            lines.append(f"⚠️ Trend check failed for {symbol}: {e}")
+    results = await asyncio.gather(*(trend_check(sym) for sym in TREND_COINS), return_exceptions=True)
+    for symbol, res in zip(TREND_COINS, results):
+        if isinstance(res, Exception):
+            lines.append(f"⚠️ Trend check failed for {symbol}: {res}")
+            continue
+        ok, reason, price = res
+        key = f"trend:{symbol}"
+        if price and ok and key not in s["positions"]:
+            lines.append(strat_open(s, key, symbol, "Trend 4H", price, reason))
+        elif price and not ok and key in s["positions"]:
+            lines.append(strat_close(s, key, price, reason))
     return lines
 
-async def run_capitulation(s: dict) -> list:
+async def run_capitulation(s: dict, print_ms: int) -> tuple:
+    """Returns (done, lines). done=False means the new funding print isn't published yet."""
     key = "funding:BTCUSDT"
     if key in s["positions"]:
-        return []
-    ok, F, threshold = capitulation_signal(await fetch_funding("BTCUSDT"))
+        return True, []
+    data = await fetch_funding("BTCUSDT")
+    if not data or data[-1][0] < print_ms - 60_000:
+        return False, []
+    ok, F, threshold = capitulation_signal([r for _, r in data])
     if not ok:
-        return []
+        return True, []
     price = await live_price("BTCUSDT")
     c4 = await fetch_klines("BTCUSDT", "4h", 120)
     stop = price - 3 * atr(c4)
     reason = (f"24h avg funding {F * 100:.4f}% is below its 180-day 10th percentile "
               f"({threshold * 100:.4f}%). Stop ${px(stop)}, exit in {FUNDING_HOLD_H}h")
-    return [strat_open(s, key, "BTCUSDT", "Funding capitulation", price, reason,
-                       stop=stop, exit_at=int(time.time() * 1000) + FUNDING_HOLD_H * 3_600_000)]
+    return True, [strat_open(s, key, "BTCUSDT", "Funding capitulation", price, reason,
+                             stop=stop, exit_at=int(time.time() * 1000) + FUNDING_HOLD_H * 3_600_000)]
 
 async def check_funding_exits(s: dict) -> list:
     lines = []
@@ -899,23 +907,33 @@ async def strategy_engine():
     await telegram(f"📈 Strategy engine started — mode: <b>{STRATEGY_MODE.upper()}</b>\n"
                    f"Trend 4H on {len(TREND_COINS)} coins + BTC funding capitulation\n"
                    f"Open paper positions: {len(s['positions'])}")
+    global _funding_retry_at
     while True:
         try:
-            now, lines = time.time(), []
-            if int(now // 14_400) != s["last_4h"] and now % 14_400 > 30:
+            now, lines, changed = time.time(), [], False
+            b4 = int(now // 14_400)
+            if b4 != s["last_4h"] and now % 14_400 >= SIGNAL_DELAY_S:
                 lines += await run_trend(s)
-                s["last_4h"] = int(now // 14_400)
-            if int(now // 28_800) != s["last_funding"] and now % 28_800 > 60:
-                lines += await run_capitulation(s)
-                s["last_funding"] = int(now // 28_800)
-            lines += await check_funding_exits(s)
-            save_strat(s)
+                s["last_4h"], changed = b4, True
+            b8 = int(now // 28_800)
+            if b8 != s["last_funding"] and now % 28_800 >= SIGNAL_DELAY_S and now >= _funding_retry_at:
+                done, new = await run_capitulation(s, b8 * 28_800_000)
+                lines += new
+                if done or now % 28_800 > 900:  # give up waiting for the print after 15 min
+                    s["last_funding"], changed = b8, True
+                else:
+                    _funding_retry_at = now + 5
+            exits = await check_funding_exits(s)
+            lines += exits
+            if changed or exits:
+                save_strat(s)
             if lines:
                 await telegram(f"📈 <b>Strategy update</b> [{STRATEGY_MODE.upper()}]\n━━━━━━━━━━━━━━━━━━\n"
                                + "\n\n".join(lines))
         except Exception as e:
             await telegram(f"⚠️ Strategy engine error: {e}")
-        await asyncio.sleep(60)
+            await asyncio.sleep(60)  # avoid an error message every second
+        await asyncio.sleep(1)
 
 @asynccontextmanager
 async def lifespan(_app):
