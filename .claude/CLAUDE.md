@@ -25,3 +25,4 @@ The Pine Script strategy lives in TradingView, not this repo.
 @rules/strategies.md
 @rules/strategy.md
 @rules/agents.md
+@rules/agents-workflow.md
