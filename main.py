@@ -158,9 +158,8 @@ price_cache: dict[str, float] = {}
 
 async def get_price(symbol="BTCUSDT"):
     try:
-        async with httpx.AsyncClient(timeout=5) as c:
-            r = await c.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}")
-            return float(r.json()["price"])
+        r = await binance_http().get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}")
+        return float(r.json()["price"])
     except Exception:
         return None
 
@@ -505,11 +504,19 @@ SPOT_BASE       = "https://api.binance.com"
 agent_state: dict = {"last_bar": {}, "last_analysis": {}}
 _macro_cache: dict = {}
 
+_binance_http: httpx.AsyncClient | None = None
+
+def binance_http() -> httpx.AsyncClient:
+    """Shared client so parallel requests reuse TLS connections instead of handshaking each time."""
+    global _binance_http
+    if _binance_http is None:
+        _binance_http = httpx.AsyncClient(timeout=10, limits=httpx.Limits(max_connections=30))
+    return _binance_http
+
 async def fetch_klines(symbol: str, interval: str, limit: int) -> list:
     """Closed candles only (Binance's last kline is still forming)."""
-    async with httpx.AsyncClient(timeout=10) as c:
-        r = await c.get(f"{SPOT_BASE}/api/v3/klines",
-                        params={"symbol": symbol, "interval": interval, "limit": limit + 1})
+    r = await binance_http().get(f"{SPOT_BASE}/api/v3/klines",
+                                 params={"symbol": symbol, "interval": interval, "limit": limit + 1})
     now_ms = int(time.time() * 1000)
     rows = [k for k in r.json() if k[6] < now_ms][-limit:]  # k[6] = close time
     return [{"t": k[0], "o": float(k[1]), "h": float(k[2]), "l": float(k[3]),
