@@ -28,7 +28,11 @@ Events from one tick are batched into a single Telegram message.
 ## Modes (`STRATEGY_MODE` env var)
 - `shadow` (default): paper positions + Telegram only. **No Binance orders.**
 - `off`: engine does not start.
-- Live order placement is **not built yet**. When it is, it must use isolated margin, ≤2x leverage (3x+ caused liquidations in backtests, 5x wiped out the portfolio), equal size per coin, and per-symbol quantity precision (the current `futures_order` rounds to 3 decimals, which only fits BTC).
+- Live order placement is **not built yet**. When it is, it must use:
+  - isolated margin and ≤2x leverage (3x+ caused liquidations in backtests, and 5x wiped out the portfolio)
+  - **volatility-targeted sizing**: notional = 2 × (equity / 10) × min(2, 0.25 / the coin's 30-day annualized realized daily vol), with total gross exposure capped at 2× equity (backtest: max DD 24% vs 52% for equal size; see agents.md, 2026-10-24 round)
+  - per-symbol quantity precision and minimum notional. The current `futures_order` rounds to 3 decimals, which only fits BTC, and vol-scaled sizes on a small account can fall below Binance minimums.
+- Rejected improvements (don't retry without new data): BTC-trend filter on alts, ADX filter, partial take-profit, breakeven stop, catastrophic stop, OI filter on capitulation.
 
 ## Gotchas
 - `fapi/v1/fundingRate` returns at most 500 records unless `startTime` is set. `fetch_funding()` sets it to 215 days ago because capitulation needs ~545 prints. Without it the threshold is `None` and the strategy silently never fires.
