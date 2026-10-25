@@ -942,6 +942,113 @@ async def strategy_engine():
             await asyncio.sleep(60)  # avoid an error message every second
         await asyncio.sleep(1)
 
+# ─── Telegram commands ────────────────────────
+# Long-polls getUpdates (no HTTPS webhook needed). Only TELEGRAM_CHAT_ID is answered.
+TG_COMMANDS = {
+    "summary":   "Market, trend status, funding and positions",
+    "market":    "24h moves and trend status of all coins",
+    "positions": "Open paper positions and results",
+    "help":      "List commands",
+}
+
+async def build_market() -> str:
+    tickers = (await binance_http().get(f"{SPOT_BASE}/api/v3/ticker/24hr",
+                                        params={"symbols": json.dumps(TREND_COINS, separators=(",", ":"))})).json()
+    by_sym = {t["symbol"]: t for t in tickers}
+    trends = await asyncio.gather(*(trend_check(s) for s in TREND_COINS), return_exceptions=True)
+    lines = []
+    for sym, tr in zip(TREND_COINS, trends):
+        t = by_sym.get(sym, {})
+        chg = float(t.get("priceChangePercent", 0))
+        state = "?" if isinstance(tr, Exception) else ("🟢 uptrend" if tr[0] else "⚪ no trend")
+        lines.append(f"{'📈' if chg >= 0 else '📉'} <b>{sym[:-4]}</b> ${px(float(t.get('lastPrice', 0)))} "
+                     f"{chg:+.1f}%  {state}")
+    up = sum(1 for tr in trends if not isinstance(tr, Exception) and tr[0])
+    try:
+        ok, F, thr = capitulation_signal([r for _, r in await fetch_funding("BTCUSDT")])
+        funding = (f"💸 BTC funding (24h avg) {F * 100:+.4f}%, buy trigger below {thr * 100:+.4f}%"
+                   + (" — <b>SIGNAL</b>" if ok else ""))
+    except Exception:
+        funding = "💸 BTC funding unavailable"
+    return ("🌍 <b>Market (24h)</b>\n" + "\n".join(lines) +
+            f"\n\n{up}/{len(TREND_COINS)} coins in uptrend (bot buys only these)\n{funding}")
+
+async def build_positions() -> str:
+    s = load_strat()
+    now_ms = time.time() * 1000
+    out = [f"💼 <b>Open paper positions</b> ({len(s['positions'])})"]
+    for p in s["positions"].values():
+        price = await live_price(p["symbol"])
+        pct = (price / p["entry"] - 1) * 100 if price else 0
+        hours = (now_ms - p["time"]) / 3_600_000
+        held = f"{hours:.0f}h" if hours < 48 else f"{hours / 24:.1f}d"
+        extra = ""
+        if "stop" in p:
+            extra = f"\n   stop ${px(p['stop'])}, exits in {max(0, (p['exit_at'] - now_ms) / 3_600_000):.0f}h"
+        out.append(f"{'🟢' if pct >= 0 else '🔴'} <b>{p['symbol'][:-4]}</b> ({p['strategy']}) "
+                   f"${px(p['entry'])} → ${px(price or 0)}  {pct:+.2f}% ({pct * STRAT_LEVERAGE:+.2f}% at "
+                   f"{STRAT_LEVERAGE}x), held {held}{extra}")
+    if not s["positions"]:
+        out.append("None. The bot is in cash, waiting for a signal.")
+    out.append("\n📊 <b>Closed trades</b>")
+    if not s["trades"]:
+        out.append("None yet.")
+    for name in sorted({t["strategy"] for t in s["trades"]}):
+        mine = [t for t in s["trades"] if t["strategy"] == name]
+        wins = sum(t["pnl_pct"] > 0 for t in mine)
+        total = sum(t["pnl_pct"] for t in mine)
+        out.append(f"{name}: {len(mine)} trades, {100 * wins / len(mine):.0f}% wins, "
+                   f"total {total:+.2f}% ({total * STRAT_LEVERAGE:+.2f}% at {STRAT_LEVERAGE}x)")
+    for t in s["trades"][-3:]:
+        out.append(f"   {'✅' if t['pnl_pct'] > 0 else '❌'} {t['symbol'][:-4]} {t['pnl_pct']:+.2f}%")
+    return "\n".join(out)
+
+async def build_summary() -> str:
+    market, positions = await asyncio.gather(build_market(), build_positions())
+    s = load_strat()
+    last = datetime.utcfromtimestamp(s["last_4h"] * 14_400).strftime("%H:%M UTC") if s["last_4h"] else "never"
+    return (f"🤖 <b>Bot summary</b> [{STRATEGY_MODE.upper()}]\n━━━━━━━━━━━━━━━━━━\n{market}\n\n"
+            f"━━━━━━━━━━━━━━━━━━\n{positions}\n\n🕐 Last trend check: {last}")
+
+def build_help() -> str:
+    return "🤖 <b>Commands</b>\n" + "\n".join(f"/{c} — {d}" for c, d in TG_COMMANDS.items())
+
+async def handle_command(text: str) -> str:
+    cmd = text.strip().split()[0].lstrip("/").split("@")[0].lower() if text.strip() else ""
+    builders = {"summary": build_summary, "status": build_summary, "start": build_summary,
+                "market": build_market, "positions": build_positions}
+    if cmd in builders:
+        return await builders[cmd]()
+    return build_help()
+
+async def telegram_commands():
+    if not TELEGRAM_TOKEN:
+        return
+    api = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+    started, offset = time.time(), 0
+    async with httpx.AsyncClient(timeout=40) as c:
+        try:
+            await c.post(f"{api}/setMyCommands", json={"commands": [
+                {"command": k, "description": v} for k, v in TG_COMMANDS.items()]})
+        except Exception:
+            pass
+        while True:
+            try:
+                r = await c.get(f"{api}/getUpdates", params={"offset": offset, "timeout": 30})
+                for u in r.json().get("result", []):
+                    offset = u["update_id"] + 1
+                    msg = u.get("message") or {}
+                    if str(msg.get("chat", {}).get("id")) != str(TELEGRAM_CHAT_ID) or msg.get("date", 0) < started:
+                        continue
+                    try:
+                        reply = await handle_command(msg.get("text", ""))
+                    except Exception as e:
+                        reply = f"⚠️ Could not build that report: {e}"
+                    await telegram(reply)
+            except Exception as e:
+                print(f"TELEGRAM POLL ERROR: {e}", flush=True)
+                await asyncio.sleep(10)
+
 @asynccontextmanager
 async def lifespan(_app):
     if LIVE_TRADING:
@@ -950,11 +1057,13 @@ async def lifespan(_app):
     monitor_task = asyncio.create_task(price_monitor())
     agent_task   = asyncio.create_task(signal_generator())
     strat_task   = asyncio.create_task(strategy_engine())
+    tg_task      = asyncio.create_task(telegram_commands())
     yield
     ws_task.cancel()
     monitor_task.cancel()
     agent_task.cancel()
     strat_task.cancel()
+    tg_task.cancel()
 
 app = FastAPI(lifespan=lifespan)
 
